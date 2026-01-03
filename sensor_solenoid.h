@@ -7,7 +7,7 @@
 #include "LoRaWan_APP.h"
 
 
-#define DEBUG_TIMING true             //  rapid cycling for debugging, not deployment
+
 
 
 // GPIO Pin Assignments
@@ -52,9 +52,9 @@
 #warning "DEBUG_TIMING is NOT defined at this point"
 #endif
 
-#define VALVE_PULSE_MS      250         //  what hunter specifies
+#define VALVE_PULSE_MS      150         //  what hunter specifies
 #if defined(DEBUG_TIMING)
-#define CYCLE_TIME_VALVE_ON   20000     //  20 second irrigation cycles, debug only
+#define CYCLE_TIME_VALVE_ON   45000     //  20 second irrigation cycles, debug only
 #define WAIT_AFTER_VALVE_CHANGE 3000    //  only wait 3 sec for debug
 #else
 #define CYCLE_TIME_VALVE_ON   600000    // 10 min in ms, cycle time with valve on, should be 600000

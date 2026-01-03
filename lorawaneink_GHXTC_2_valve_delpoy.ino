@@ -1,23 +1,14 @@
-/* Heltec Automation LoRaWAN communication example
- *
- * Function:
- * 1. Upload node data to the server using the standard LoRaWAN protocol.
- * 2. Accept and display messages on the screen
- * 3. Calibrate the time from the network and then use an internal crystal oscillator to determine the time
- * 4. Read sensor data and upload it to the server. Receive server messages and display them on the screen.
- * 
- * If you do not fill in the correct WIFI SSID and password, the E-Ink will not display.
- * 
- * Description:
- * 1. Communicate using LoRaWAN protocol.
- * 
- * Library url: https://github.com/HelTecAutomation/Heltec_ESP32
- * Support: support@heltec.cn
- *
- * HelTec AutoMation, Chengdu, China
- * --------------
- * https://www.heltec.org
- * */
+// Heltec Automation LoRaWAN communication example, modified 
+
+//        TYPE OF NODE HERE, defines before includes so that they can modify pre-complie directives in the includes
+
+//#define DEBUG_TIMING true  //  rapid cycling for debugging, not deployment
+//#define CALIBRATION_MODE    true      //  FOR CALIBRATING THE SENSORS, NO LORAWAN, SERIAL OUTPUT
+
+//define REED_NODE       true      //  count reed closures of one switch for water flow meter
+#define VALVE_NODE true  //  two valve controlller and possible line pressure
+//#define SOIL_SENSOR_NODE true     //  two soil temp moist and possible pH
+//#define LAKE_NODE  true           //  one 16 bit number reflecting lake depth, calibration constants in device table
 
 #include <Arduino.h>
 #include "LoRaWan_APP.h"
@@ -52,7 +43,7 @@
 #define RTC_SLOW_STRUCT_PTR(type, idx) \
   ((volatile type *)(RTC_SLOW_BYTE_MEM + (idx) * sizeof(uint32_t)))
 
-//  for prefs namespace access
+//  for prefs namespace access and UI semaphore
 constexpr const char *NS = "cfg";
 constexpr const char *K_LAKE_MM = "lake_depth_mm";
 constexpr const char *K_WAKE_TH = "wake_th";
@@ -67,8 +58,6 @@ volatile ValveState_t *valveState = RTC_SLOW_STRUCT_PTR(ValveState_t, ULP_VALVE_
 RTC_DATA_ATTR volatile uint32_t g_status_uplink_at = 0;
 static const uint32_t STATUS_UPLINK_DELAY_MS = 3000;  // ~3 s after RX2
 
-RTC_DATA_ATTR char g_name[13] = "no name";  // screen display name
-RTC_DATA_ATTR uint32_t epd_hygiene = 0;     //    to reset the screen ever 50 wakes
 
 DEPG0290BxS800FxX_BW display(5, 4, 3, 6, 2, 1, -1, 6000000);  // rst,dc,cs,busy,sck,mosi,miso,frequency
 //GXHTC gxhtc;
@@ -84,20 +73,20 @@ static uint32_t i2c_quiet_until_ms = 0;
 static bool i2c_ready = 0;
 static bool join_inflight = false;
 static uint32_t join_retry_at_ms = 0;
-RTC_DATA_ATTR uint16_t pressResult = 0;  //  used for adc result as global, lake depth and line pressure
+
 bool g_skip_next_decrement = false;
 // for display
 volatile bool g_need_display = false;
-volatile ValveCmd_t g_cmd;  // written by RX/ISR or LoRa callback
-volatile uint8_t dl_flags, dl_unitsA, dl_unitsB;
 volatile uint32_t g_awake_until_ms = 0;  // keep CPU on until this time
+
+
 // [GPT] helper: wait for E-Ink BUSY to go idle without blocking the whole system
 bool eink_wait_idle(uint32_t timeout_ms) {
 
   const bool BUSY_ACTIVE = HIGH;  // DEPG0290 panels pull BUSY high while refreshing
   uint32_t deadline = millis() + timeout_ms;
   while (digitalRead(EPD_BUSY_PIN) == BUSY_ACTIVE) {
-    delay(500);  // yield to other tasks (LoRa, etc.)
+    vTaskDelay(pdMS_TO_TICKS(500));  // yield to other tasks (LoRa, etc.)
 
     if ((int32_t)(millis() - deadline) >= 0) return false;  // timed out
   }
@@ -106,21 +95,11 @@ bool eink_wait_idle(uint32_t timeout_ms) {
 
 
 char buffer[64];
-volatile ValveState_t vlv_packet_pend;  // used to keep the command and the state independent until resolved
-
-//VALVE_TEST ia defined in sensor_solenoid.h and makes things cycle fast for
-
-//#define CALIBRATION_MODE            //
-//#define REED_NODE       true      //  count reed closures of one switch for water flow meter
-#define VALVE_NODE true  //  two valve controlller and possible line pressure
-//#define SOIL_SENSOR_NODE true     //  two soil temp moist and possible pH
-//#define LAKE_NODE  true           //  one 16 bit number reflecting lake depth, calibration constants in device table
-//#define CALIBRATION_MODE          //  FOR CALIBRATING THE PRESSURE SENSORS, NO LORAWAN, SERIAL OUTPUT
 
 /* OTAA para*/
-uint8_t devEui[] = { 0x70, 0xB3, 0xD5, 0x7E, 0xD0, 0x06, 0x53, 0xff };
+uint8_t devEui[] = { 0x70, 0xB3, 0xD5, 0x7E, 0xD0, 0x06, 0x53, 0xfa };
 uint8_t appEui[] = { 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 };
-uint8_t appKey[] = { 0x74, 0xD6, 0x6E, 0x63, 0x45, 0x82, 0x48, 0x27, 0xFE, 0xC5, 0xB7, 0x70, 0xBA, 0x2B, 0x50, 0x55 };
+uint8_t appKey[] = { 0x74, 0xD6, 0x6E, 0x63, 0x45, 0x82, 0x48, 0x27, 0xFE, 0xC5, 0xB7, 0x70, 0xBA, 0x2B, 0x50, 0x50 };
 
 /* ABP para --  not used for this project*/
 uint8_t nwkSKey[] = { 0x15, 0xb1, 0xd0, 0xef, 0xa4, 0x63, 0xdf, 0xbe, 0x3d, 0x11, 0x18, 0x1e, 0x1e, 0xc7, 0xda, 0x85 };
@@ -138,25 +117,30 @@ DeviceClass_t loraWanClass = CLASS_A;
 
 /*the application data transmission duty cycle.  value in [ms].*/
 #if defined(DEBUG_TIMING)
-RTC_DATA_ATTR uint32_t appTxDutyCycle = 30 * 1 * 1000;  //  30 second sleeps
+RTC_DATA_ATTR uint32_t appTxDutyCycle = 60 * 1 * 1000;  //  60 second sleeps
+//#define CYCLE_TIME_VALVE_ON   45000    // debuf, go fast, should be 600000
 #else
-RTC_DATA_ATTR uint32_t appTxDutyCycle = 60* 60 * 1 * 1000;  //min/hr * sec/min * hrs * min/ms
+RTC_DATA_ATTR uint32_t appTxDutyCycle = 60 * 60 * 3 * 1000;  //min/hr * sec/min * hrs * min/ms
+//#define CYCLE_TIME_VALVE_ON   600000    // 10 min in ms, cycle time with valve on, should be 600000
 #endif
 RTC_DATA_ATTR volatile uint32_t TxDutyCycle_hold = 3600000;  //  backup TxDutyCycleHold
-RTC_DATA_ATTR volatile uint8_t initialCycleFast = 0;         //  number of times to cycle fast on startup
+RTC_DATA_ATTR volatile int8_t initialCycleFast;             //  number of times to cycle fast on startup, initialized with FAST_BURST_COUNT on cold boot
 #define FAST_BURST_COUNT 10                                  // cycles to conclude with rapid time for ADR on cold boot
 RTC_DATA_ATTR volatile uint32_t g_sched_override_ms = 0;     //  pending cycle time changes to apply just before sleep
-RTC_DATA_ATTR uint32_t inv_m_u32 = 125;                      // b-10 no sleve: 98 selve tranduced: about 125
-RTC_DATA_ATTR uint16_t lakeRaw = 0;                          //  for display
-RTC_DATA_ATTR int32_t b_x10 = -153;                          // b in 0.1 m units (−200..200 covers −20..20 m), about -150
-RTC_DATA_ATTR uint16_t g_lake_depth_mm = 2000;               // sensor depth in mm for lake depth
-RTC_DATA_ATTR int16_t lake_level_mm = 0;                     // lakeLevel_mm is sensor reading - sensor depth
-RTC_DATA_ATTR uint16_t sensorMeasuredDepth;                  //  the measured depth of the sensor in mm
-static const uint32_t TX_CYCLE_FAST_TIME = 20000ul;          //  set the fast cycle time that has limited cycles
+
+static const uint32_t TX_CYCLE_FAST_TIME = 60000ul;          //  set the fast cycle time that has limited cycles
+
+RTC_DATA_ATTR uint32_t inv_m_u32 = 100;                         //  valves: (1/m, b_x10):  1/8 in ch (extra sleve) 190, -2, no sleve (1/4 inch) 100, -130
+RTC_DATA_ATTR int32_t b_x10 = -130;
+RTC_DATA_ATTR uint32_t g_lake_depth_mm = 0;
+RTC_DATA_ATTR char g_name[12] = {0};
+uint16_t pressResult = 0;
+
+RTC_DATA_ATTR volatile ValveCmd_t g_cmd;
+
 //These are in RTC defined in lorawanapp.cpp
 extern int revrssi;
 extern int revsnr;
-
 
 /*OTAA or ABP*/
 bool overTheAirActivation = true;
@@ -171,7 +155,7 @@ bool isTxConfirmed = false;
 #ifdef REED_NODE
 uint8_t appPort = 8;  //  REED_NODE port 8
 #elif defined VALVE_NODE
-uint8_t appPort = 9;                                         // VALVE_NODE port 9
+uint8_t appPort = 9;  // VALVE_NODE port 9
 #elif defined SOIL_SENSOR_NODE
 uint8_t appPort = 11;  // SOIL_PH_SENSOR_NODE port 11
 #elif defined LAKE_NODE
@@ -180,40 +164,32 @@ uint8_t appPort = 12;  // LAKE_NODE port 12
 #error "Define a node type in the list REED_NODE, VALVE_NODE, SOIL_SENSOR_NODE, LAKE_NODE"
 #endif
 
-/*!
- * Number of trials to transmit the frame, if the LoRaMAC layer did not
- * receive an acknowledgment. The MAC performs a datarate adaptation,
- * according to the LoRaWAN Specification V1.0.2, chapter 18.4, according
- * to the following table:
- *
- * Transmission nb | Data Rate
- * ----------------|-----------
- * 1 (first)       | DR
- * 2               | DR
- * 3               | max(DR-1,0)
- * 4               | max(DR-1,0)
- * 5               | max(DR-2,0)
- * 6               | max(DR-2,0)
- * 7               | max(DR-3,0)
- * 8               | max(DR-3,0)
- *
- * Note, that if NbTrials is set to 1 or 2, the MAC will not decrease
- * the datarate, in case the LoRaMAC layer did not receive an acknowledgment
- */
-uint8_t confirmedNbTrials = 1;
-
+// * Note, that if NbTrials is set to 1 or 2, the MAC will not decrease
+// * the datarate, in case the LoRaMAC layer did not receive an acknowledgment
+// */
+uint8_t confirmedNbTrials = 4;
 
 // Main cycle order (sketch):
 // ValveCmd_t g_cmd; snapshot_cmd(&g_cmd);
 // apply_downlink_snapshot(&g_cmd, &valveState);
 // tick_timers(&valveState);              // your existing decrement/auto-off
+const char *deviceStateToString(eDeviceState_LoraWan s) {
+  switch (s) {
+    case DEVICE_STATE_INIT: return "DEVICE_STATE_INIT";
+    case DEVICE_STATE_JOIN: return "DEVICE_STATE_JOIN";
+    case DEVICE_STATE_SEND: return "DEVICE_STATE_SEND";
+    case DEVICE_STATE_CYCLE: return "DEVICE_STATE_CYCLE";
+    case DEVICE_STATE_SLEEP: return "DEVICE_STATE_SLEEP";
+    default: return "DEVICE_STATE_UNKNOWN";
+  }
+}
 
 static inline bool still_awake() {
   return (int32_t)(millis() - g_awake_until_ms) < 0;
 }
 
 static inline bool rx_windows_clear() {
-  return (g_last_tx_ms == 0) ? 0 : ((int32_t)(millis() - (g_last_tx_ms + 2400)) >= 0);
+  return (g_last_tx_ms == 0) ? 0 : ((int32_t)(millis() - (g_last_tx_ms + 2500)) >= 0);
 }
 
 inline uint32_t read_count32() {
@@ -245,16 +221,46 @@ inline uint16_t depth_m_from_raw(int16_t raw) {
 
 
 // scheduler with three cases, fast, valve on and normal
-static inline void schedule_next_cycle(void) {
-  if ((initialCycleFast > 0) && (valveState->timeA == 0) && (valveState->timeB == 0)) {  //  continue fast duty cycle, leave appTxDutyCycle alone
-    txDutyCycleTime = TX_CYCLE_FAST_TIME + randr(-APP_TX_DUTYCYCLE_RND, APP_TX_DUTYCYCLE_RND);
-    LoRaWAN.cycle(txDutyCycleTime);  // respects valve-open hold/restore
-    initialCycleFast--;              // fast cycle time counter dec
-  } else {
-    txDutyCycleTime = appTxDutyCycle + randr(-APP_TX_DUTYCYCLE_RND, APP_TX_DUTYCYCLE_RND);
-    LoRaWAN.cycle(txDutyCycleTime);  // regular appTxDutyCycle respected
+// Pick base cycle time:
+//  - on cold boot, FAST_BURST_COUNT cycles at TX_CYCLE_FAST_TIME while no valves are timed
+//  - otherwise, if any valve timer is non-zero, use CYCLE_TIME_VALVE_ON
+//  - otherwise, use appTxDutyCycle (baseline)
+static inline uint32_t choose_cycle_base_ms(void) {
+  // keep your existing fast-ADR bursts on cold boot, only when both valves idle
+  if ((initialCycleFast > 0) && (valveState->timeA == 0) && (valveState->timeB == 0)) {
+    initialCycleFast--;
+  Serial.print(initialCycleFast);
+  Serial.println(" CycleFast>0, no valves on");
+    return TX_CYCLE_FAST_TIME;
   }
-Serial.print("appTxDutyCycle: "); Serial.print(appTxDutyCycle); Serial.println(" ms");
+
+  // if either valve has a non-zero timer, use the "valve active" period
+  if ((valveState->timeA != 0) || (valveState->timeB != 0)) {
+      Serial.println("valves on");
+    return CYCLE_TIME_VALVE_ON;
+  }
+
+  // otherwise, use the normal duty cycle
+    Serial.println(" ApxDutyCycle cycle time");
+  return appTxDutyCycle;
+}
+
+// Simple scheduler: pick base period, add random dither, program LoRaWAN
+static inline void schedule_next_cycle(void)
+{
+  const uint32_t base_ms = choose_cycle_base_ms();
+
+  const int32_t dither_ms = (int32_t)randr(-APP_TX_DUTYCYCLE_RND, APP_TX_DUTYCYCLE_RND);
+  int32_t next_ms = (int32_t)base_ms + dither_ms;
+  if (next_ms < 0) next_ms = 0;
+
+  txDutyCycleTime = (uint32_t)next_ms;
+  
+  Serial.print(txDutyCycleTime);
+  Serial.println(" cycle time set...");
+
+
+  LoRaWAN.cycle(txDutyCycleTime);
 }
 
 void display_status() {
@@ -267,7 +273,7 @@ void display_status() {
   //common screen entries:  battery, cycle time, rssi, snr, display name
   snprintf(buffer, sizeof(buffer), "battery: %lu %%", RTC_SLOW_MEMORY[ULP_BAT_PCT]);  // bat_cap8() populates this, and is run in prepareDataFrame
   display.drawString(210, 50, buffer);
-  snprintf(buffer, sizeof(buffer), "cycle %lu min", (uint32_t)appTxDutyCycle / 60000);  //  SHOULD BE 60000 milliseconds to mins
+  snprintf(buffer, sizeof(buffer), "cycle %lu min", choose_cycle_base_ms() / 60000);  //  SHOULD BE 60000 milliseconds to mins
   display.drawString(210, 70, buffer);
   snprintf(buffer, sizeof(buffer), "rssi (dBm): %d snr: %d", revrssi, revsnr);
   display.drawString(210, 90, buffer);
@@ -336,7 +342,7 @@ void display_status() {
 #endif
 
 
-  Serial.print("about to display.display \n");
+  //Serial.print("about to display.display \n");
   display.display();
 
   // for(int i = 0; i < 25; i++){
@@ -370,9 +376,11 @@ void pop_data(void) {
     pressResult = depth_m_from_raw(readMCP3421avg_cont());
     wPres[0] = (pressResult >> 8);
     wPres[1] = (pressResult & 0xFF);
+    Serial.printf("pressure result 1, 2 %u, %u\n", wPres[0], wPres[1]);
   } else {
     // optional fallback: zero
     wPres[0] = wPres[1] = 0;
+    Serial.printf("pressure result fallback to zero \n");
   }
 #endif
 
@@ -448,9 +456,6 @@ static void prepareTxFrame(uint8_t port) {
    *data is pressure (msb, lsb) in raw adc conversion needs to be calibrated and converted to psi
    */
 
-
-
-  // [GPT] removed unused 'puc' variable
   appDataSize = 0;
 
 #ifdef REED_NODE
@@ -526,29 +531,12 @@ void downLinkDataHandle(McpsIndication_t *mcpsIndication) {
 
   Serial.printf("+++++REV DATA:%s,RXSIZE %u,PORT %u\r\n",
                 rxw, (unsigned)len, (unsigned)port);
-  // Parse EXACTLY [timeA, timeB, flags] from buf, then log
-  if (len >= 3) {
-    const uint8_t dl_timeA = buf[0];
-    const uint8_t dl_timeB = buf[1];
-    const uint8_t dl_flags = buf[2];
-
-    Serial.printf("DL6: timeA=%u, timeB=%u, flags=0x%02X (raw=%02X%02X%02X)\n",
-                  (unsigned)dl_timeA, (unsigned)dl_timeB, (unsigned)dl_flags,
-                  buf[0], buf[1], buf[2]);
-
-    // Only after logging, copy into your state if that’s intended:
-    // valveState->timeA = dl_timeA;
-    // valveState->timeB = dl_timeB;
-    // valveState->flags = dl_flags;
-  } else {
-    Serial.printf("DL6: short payload len=%u\n", (unsigned)len);
-  }
 
   revrssi = mcpsIndication->Rssi;
   revsnr = mcpsIndication->Snr;
 
   switch (port) {
-    case 5:
+    case 5:  //  change the cycle time
       {
         if (len != 1 && len != 2) {
           Serial.println("cycle-time ignored (len!=1/2)");
@@ -560,22 +548,19 @@ void downLinkDataHandle(McpsIndication_t *mcpsIndication) {
         if (minutes > 1440) minutes = 1440;
         uint32_t ms = minutes * 60000u;
 
-#if defined(VALVE_NODE)
-        if (valveState->onA || valveState->onB) {
-          TxDutyCycle_hold = ms;
-          break;
-        }
-#endif
         appTxDutyCycle = ms;
         g_sched_override_ms = ms;
         deviceState = DEVICE_STATE_CYCLE;  // re-run scheduler once
+
+        display_status();                 //  display it
+        vTaskDelay(pdMS_TO_TICKS(3000));  //  give SPI bus a chance
 
         Serial.printf("cycle req: %u min -> %lu ms\n", (unsigned)minutes, (unsigned long)ms);
         break;
       }
 
-    case 6:
-      {  // ValveCmd_t downlink = [flags, unitsA, unitsB]
+    case 6:  //  set the valve status
+      {      // ValveCmd_t downlink = [flags, unitsA, unitsB]
         if (len != 3) {
           Serial.printf("[DL6] bad length: %u (want 3)\n", (unsigned)len);
           break;
@@ -586,16 +571,18 @@ void downLinkDataHandle(McpsIndication_t *mcpsIndication) {
         cmd.unitsA = buf[0];  // <— A ticks
         cmd.unitsB = buf[1];  // <— B ticks
 
-        // optional: keep your globals in sync if you log them elsewhere
-        dl_flags = cmd.flags;
-        dl_unitsA = cmd.unitsA;
-        dl_unitsB = cmd.unitsB;
+        post_cmd(&cmd);             // drop into mailbox (see Fix 2)
+        apply_downlink_snapshot();  // atomically read+clear & act
+        Serial.printf("VALVE AFTER DL6: onA=%u timeA=%u onB=%u timeB=%u latchA=%u latchB=%u\n",
+                      (unsigned)valveState->onA,
+                      (unsigned)valveState->timeA,
+                      (unsigned)valveState->onB,
+                      (unsigned)valveState->timeB,
+                      (unsigned)valveState->latchA,
+                      (unsigned)valveState->latchB);
+        vTaskDelay(pdMS_TO_TICKS(WAIT_AFTER_VALVE_CHANGE));  //  no Rx window open, let the cpu free
 
-        post_cmd(&cmd);                  // drop into mailbox (see Fix 2)
-        apply_downlink_snapshot();       // atomically read+clear & act
-        vTaskDelay(pdMS_TO_TICKS(WAIT_AFTER_VALVE_CHANGE));  //  no Rx window open, hog the cpu
-
-        pop_data();                       //  new data after valve state change and delay
+                       //  new data after valve state change and delay, will pop_data as part of SEND
         display_status();                 //  display it
         vTaskDelay(pdMS_TO_TICKS(3000));  //  give SPI bus a chance
         deviceState = DEVICE_STATE_SEND;  //  send it
@@ -605,7 +592,7 @@ void downLinkDataHandle(McpsIndication_t *mcpsIndication) {
         break;
       }
 
-    case 7:
+    case 7:  // name the device
       {
         constexpr size_t MAX_NAME = 12;
         if (len == 0 || len > MAX_NAME) {
@@ -708,10 +695,6 @@ void downLinkDataHandle(McpsIndication_t *mcpsIndication) {
 
   Serial.println("downlink processed");
 }  // of function
-
-/* set up the ULP to count pulses, and wake on 100 pulses, after each lorawan data send, the last_pulse_count is advanced*/
-
-/* set up the ULP to count pulses, and wake on 100 pulses, after each lorawan data send, the last_pulse_count is advanced*/
 
 /* set up the ULP to count pulses, and wake on 100 pulses, after each lorawan data send, the last_pulse_count is advanced*/
 
@@ -879,9 +862,6 @@ void setup() {
 
   Serial.begin(115200);
   delay(500);
-  // Debugging: Check the appPort value
-  Serial.print("App Port is set to: ");
-  Serial.println(appPort);  // This should print 11 for SOIL_SENSOR_NODE
 
   if (g_uiSem == NULL) {
     g_uiSem = xSemaphoreCreateBinary();
@@ -941,18 +921,13 @@ void setup() {
   // figure out why we’re here
   esp_sleep_wakeup_cause_t cause = esp_sleep_get_wakeup_cause();
 
-  //  init cycles_fast cycles one on cold boot
-  if (initialCycleFast == 0xFF) {         // first real boot
-    initialCycleFast = FAST_BURST_COUNT;  // seed
-  }
-
   switch (cause) {
     case ESP_SLEEP_WAKEUP_ULP:
       {
         // ── ULP woke us up
         uint32_t count = read_count32();
 
-        Serial.printf("Woke by ULP reed trigger, pulse count = %u\n", count);
+        //Serial.printf("Woke by ULP reed trigger, pulse count = %u\n", count);
         xSemaphoreGive(g_uiSem);
       }
       break;
@@ -968,8 +943,11 @@ void setup() {
 
     case ESP_SLEEP_WAKEUP_UNDEFINED:  //  THIS IS COLD RESTART
       {
-        TxDutyCycle_hold = 30000;  //  30 sec backup
-                                   //display.display();
+        //  init cycles_fast cycles one on cold boot
+        initialCycleFast = FAST_BURST_COUNT;  // seed
+
+        TxDutyCycle_hold = appTxDutyCycle;  //  appTxDutyCycle should be sssigned before this point at the top of this code
+                                            //display.display();
         xSemaphoreGive(g_uiSem);
 
         valveState->onA = 0;
@@ -979,10 +957,10 @@ void setup() {
         valveState->onA = 0;
         valveState->onB = 0;  // e.g., set to 0
         controlValve(0, 0);
+        delay(250);  //  let the cap charge for the next valve action
         controlValve(1, 0);
 #endif
 
-        initialCycleFast = 10;
         memset(RTC_SLOW_MEM, 0, CONFIG_ULP_COPROC_RESERVE_MEM);
 
         // --- NEW: prefs restores (keep namespaces/keys from your newer version)
@@ -1043,10 +1021,22 @@ void setup() {
       Serial.printf("pressure * 100 : %i\n", (int)((float)pressResult / 100.0f));
       loop_count++;
       switch (loop_count % 4) {
-        case (0): controlValve(0, 1); Serial.printf("A : on\n");break;
-        case (1): controlValve(0, 1); Serial.printf("B : on\n");break;
-        case (2): controlValve(0, 0); Serial.printf("A : off\n");break;
-        case (3): controlValve(1, 0); Serial.printf("B : off\n");break;
+        case (0):
+          controlValve(0, 1);
+          Serial.printf("A : on\n");
+          break;
+        case (1):
+          controlValve(1, 1);
+          Serial.printf("B : on\n");
+          break;
+        case (2):
+          controlValve(0, 0);
+          Serial.printf("A : off\n");
+          break;
+        case (3):
+          controlValve(1, 0);
+          Serial.printf("B : off\n");
+          break;
       }
     }
     delay(5000);
@@ -1066,10 +1056,10 @@ void setup() {
   vTaskDelay(pdMS_TO_TICKS(3000));  //  let SPI settle
 
   Mcu.begin(HELTEC_BOARD, SLOW_CLK_TPYE);
-  Serial.printf("wake up case completed, LORAWAN_APP_DATA_MAX_SIZE = %u\n", (unsigned)LORAWAN_APP_DATA_MAX_SIZE);
-  delay(100);
+  //Serial.printf("wake up case completed, LORAWAN_APP_DATA_MAX_SIZE = %u\n", (unsigned)LORAWAN_APP_DATA_MAX_SIZE);
+  vTaskDelay(pdMS_TO_TICKS(100));
 
-  Serial.println("BOOT: after HELTEC_B start, Serial ready");
+  //Serial.println("BOOT: after HELTEC_B start, Serial ready");
   if (!adc.begin(ADC_ADDR, &Wire)) {
     Serial.println("MCP3421 not found on Wire");
   } else Serial.println("MCP3421 found");
@@ -1080,9 +1070,10 @@ void setup() {
 void loop() {
   static eDeviceState_LoraWan prevState = (eDeviceState_LoraWan)-1;
   if (prevState != deviceState) {
-    Serial.printf("STATE -> %d\n", (int)deviceState);
+    Serial.printf("STATE -> %s\n", deviceStateToString(deviceState));
     prevState = deviceState;
   }
+
   switch (deviceState) {
     case DEVICE_STATE_INIT:
       {
@@ -1103,6 +1094,8 @@ void loop() {
         //  Join succeeded → clear inflight so UI can run again safely
         join_inflight = false;
         //Serial.println("In SEND");
+        pop_data();                       //  new data after valve state change and delay
+        vTaskDelay(pdMS_TO_TICKS(1000));  //   let pop_data be fully done...
         // STOCK: build payload, send, then advance to CYCLE
         prepareTxFrame(appPort);
         LoRaWAN.send();

@@ -1,6 +1,7 @@
 // valve_logic.h
 #pragma once
 #include "sensor_solenoid.h"
+#include <stdint.h>
 
 extern bool g_skip_next_decrement;
 extern volatile ValveState_t *valveState;

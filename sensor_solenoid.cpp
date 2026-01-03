@@ -78,10 +78,10 @@ void hardware_pins_init(void) {
 }
 
 // Map valves 1→index 0, 2→index 1
-//static const uint8_t forwardPins[] = { PIN_IN1, PIN_IN3 };
-//static const uint8_t reversePins[] = { PIN_IN2, PIN_IN4 };
-static const uint8_t forwardPins[] = { PIN_IN2, PIN_IN4 };
-static const uint8_t reversePins[] = { PIN_IN1, PIN_IN3 };
+static const uint8_t forwardPins[] = { PIN_IN1, PIN_IN3 };
+static const uint8_t reversePins[] = { PIN_IN2, PIN_IN4 };
+// static const uint8_t forwardPins[] = { PIN_IN2, PIN_IN4 };
+// static const uint8_t reversePins[] = { PIN_IN1, PIN_IN3 };
 
 static const size_t valveCount = sizeof(forwardPins) / sizeof(forwardPins[0]);
 
@@ -111,7 +111,7 @@ uint8_t bat_cap8() {
   digitalWrite(ADC_CTL_PIN, HIGH);
   delay(40);
   uint16_t raw = analogRead(VBAT_READ_PIN);
-  Serial.printf("read bat_cap8() pin_adc_ctl HIGH = %u\n", raw);
+  //Serial.printf("read bat_cap8() pin_adc_ctl HIGH = %u\n", raw);
   digitalWrite(ADC_CTL_PIN, LOW);
 
   int16_t diff = raw - mid;    // –∞…+∞
@@ -573,9 +573,5 @@ inline uint32_t addJitterClampMin(uint32_t base_ms, int32_t jitter_ms, uint32_t 
 void scheduleValveOnCycle(void) {
   TxDutyCycle_hold = appTxDutyCycle;     // save current
   appTxDutyCycle = CYCLE_TIME_VALVE_ON;  // switch to valve-on cycle
-  txDutyCycleTime = addJitterClampMin(
-    appTxDutyCycle,
-    randr(-APP_TX_DUTYCYCLE_RND, APP_TX_DUTYCYCLE_RND),
-    10u * 60000u  // hard floor: 10 minutes
-  );
+  txDutyCycleTime = addJitterClampMin( appTxDutyCycle, randr( -APP_TX_DUTYCYCLE_RND, APP_TX_DUTYCYCLE_RND), 10u * 60000u );  // hard floor: 10 minutes
 }
