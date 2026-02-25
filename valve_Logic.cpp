@@ -43,14 +43,14 @@ void apply_downlink_snapshot(void) {
 
   // --- HARD OFF overrides ---
 
-  if (f & OFF_A) {
+  if (f & offA) {
     controlValve(0, 0);
     valveState->onA = 0;
     valveState->latchA = 0;
     valveState->timeA = 0;
   }
 
-  if (f & OFF_B) {
+  if (f & offB) {
     controlValve(1, 0);
     valveState->onB = 0;
     valveState->latchB = 0;
@@ -141,8 +141,8 @@ void tick_timers(volatile ValveState_t* v) {
     v->onA = 0;
 
     // Optional: trigger an immediate status uplink so server sees OFF quickly
+
     xSemaphoreGive(g_uiSem);
-    pop_data();
     vTaskDelay(pdMS_TO_TICKS(3000));
     deviceState = DEVICE_STATE_SEND;
   }

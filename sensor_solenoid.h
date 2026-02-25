@@ -6,9 +6,8 @@
 #include <stddef.h>
 #include "LoRaWan_APP.h"
 
-
-
-
+extern RTC_DATA_ATTR uint16_t g_v0_act_ms;
+extern RTC_DATA_ATTR uint16_t g_v1_act_ms;
 
 // GPIO Pin Assignments
 #define PIN_SDA         39   // 
@@ -26,6 +25,10 @@
 #define PIN_REED_P      17  // 
 #define ADC_CTL_PIN     46  // to read bat voltage
 #define VBAT_READ_PIN   7   // read voltge divider with 100k/490k divider.  
+
+// ADC raw values corresponding to battery voltage
+#define ADC_RAW_3V1   720   // <-- measure at 3.1 V
+#define ADC_RAW_4V1   980   // <-- measure at 4.1 V
 
 #define PULSE_THRESHOLD  100   // default, but MVS stores last uint16_t sent to port 8
                               // change this value to adjust the default wake-up count for the reed
@@ -52,7 +55,7 @@
 #warning "DEBUG_TIMING is NOT defined at this point"
 #endif
 
-#define VALVE_PULSE_MS      150         //  what hunter specifies
+#define VALVE_PULSE_MS      250         //  what hunter specifies
 #if defined(DEBUG_TIMING)
 #define CYCLE_TIME_VALVE_ON   45000     //  20 second irrigation cycles, debug only
 #define WAIT_AFTER_VALVE_CHANGE 3000    //  only wait 3 sec for debug

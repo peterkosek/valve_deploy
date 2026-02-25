@@ -1,9 +1,9 @@
-// Heltec Automation LoRaWAN communication example, modified 
+// Heltec Automation LoRaWAN communication example, modified
 
 //        TYPE OF NODE HERE, defines before includes so that they can modify pre-complie directives in the includes
 
 //#define DEBUG_TIMING true  //  rapid cycling for debugging, not deployment
-//#define CALIBRATION_MODE    true      //  FOR CALIBRATING THE SENSORS, NO LORAWAN, SERIAL OUTPUT
+//#define CALIBRATION_MODE true  //  FOR CALIBRATING THE SENSORS, NO LORAWAN, SERIAL OUTPUT, trips valves on and off
 
 //define REED_NODE       true      //  count reed closures of one switch for water flow meter
 #define VALVE_NODE true  //  two valve controlller and possible line pressure
@@ -50,8 +50,8 @@ constexpr const char *K_WAKE_TH = "wake_th";
 constexpr const char *K_NAME = "screenMsg";
 constexpr const char *K_INV_M = "inv_m_u32";
 constexpr const char *K_BX10 = "b_x10";
+constexpr const char *NVS_NS = "lorawan";  //  for nvs storage of devEui and appKey
 SemaphoreHandle_t g_uiSem;
-// 3) Now you can declare C-pointers into that region:
 
 volatile ValveState_t *valveState = RTC_SLOW_STRUCT_PTR(ValveState_t, ULP_VALVE_A);
 
@@ -81,25 +81,19 @@ volatile uint32_t g_awake_until_ms = 0;  // keep CPU on until this time
 
 
 // [GPT] helper: wait for E-Ink BUSY to go idle without blocking the whole system
-bool eink_wait_idle(uint32_t timeout_ms) {
+struct BoardIdentity {
+  bool provisioned;
+  bool valve_open_fwd[2];
+};
 
-  const bool BUSY_ACTIVE = HIGH;  // DEPG0290 panels pull BUSY high while refreshing
-  uint32_t deadline = millis() + timeout_ms;
-  while (digitalRead(EPD_BUSY_PIN) == BUSY_ACTIVE) {
-    vTaskDelay(pdMS_TO_TICKS(500));  // yield to other tasks (LoRa, etc.)
-
-    if ((int32_t)(millis() - deadline) >= 0) return false;  // timed out
-  }
-  return true;
-}
 
 
 char buffer[64];
 
 /* OTAA para*/
-uint8_t devEui[] = { 0x70, 0xB3, 0xD5, 0x7E, 0xD0, 0x06, 0x53, 0xfa };
+uint8_t devEui[] = { 0x70, 0xB3, 0xD5, 0x7E, 0xD0, 0x06, 0x53, 0xff };
 uint8_t appEui[] = { 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 };
-uint8_t appKey[] = { 0x74, 0xD6, 0x6E, 0x63, 0x45, 0x82, 0x48, 0x27, 0xFE, 0xC5, 0xB7, 0x70, 0xBA, 0x2B, 0x50, 0x50 };
+uint8_t appKey[] = { 0x74, 0xD6, 0x6E, 0x63, 0x45, 0x82, 0x48, 0x27, 0xFE, 0xC5, 0xB7, 0x70, 0xBA, 0x2B, 0x50, 0x55 };
 
 /* ABP para --  not used for this project*/
 uint8_t nwkSKey[] = { 0x15, 0xb1, 0xd0, 0xef, 0xa4, 0x63, 0xdf, 0xbe, 0x3d, 0x11, 0x18, 0x1e, 0x1e, 0xc7, 0xda, 0x85 };
@@ -117,23 +111,30 @@ DeviceClass_t loraWanClass = CLASS_A;
 
 /*the application data transmission duty cycle.  value in [ms].*/
 #if defined(DEBUG_TIMING)
-RTC_DATA_ATTR uint32_t appTxDutyCycle = 60 * 1 * 1000;  //  60 second sleeps
-//#define CYCLE_TIME_VALVE_ON   45000    // debuf, go fast, should be 600000
+RTC_DATA_ATTR uint32_t appTxDutyCycle = 60 * 60 * 1 * 1000;  //  60 second sleeps
+#define CYCLE_TIME_VALVE_ON 45000                            // debuf, go fast, should be 600000
 #else
 RTC_DATA_ATTR uint32_t appTxDutyCycle = 60 * 60 * 3 * 1000;  //min/hr * sec/min * hrs * min/ms
-//#define CYCLE_TIME_VALVE_ON   600000    // 10 min in ms, cycle time with valve on, should be 600000
+#define CYCLE_TIME_VALVE_ON 600000  // 10 min in ms, cycle time with valve on, should be 600000
 #endif
 RTC_DATA_ATTR volatile uint32_t TxDutyCycle_hold = 3600000;  //  backup TxDutyCycleHold
-RTC_DATA_ATTR volatile int8_t initialCycleFast;             //  number of times to cycle fast on startup, initialized with FAST_BURST_COUNT on cold boot
+RTC_DATA_ATTR volatile int8_t initialCycleFast;              //  number of times to cycle fast on startup, initialized with FAST_BURST_COUNT on cold boot
 #define FAST_BURST_COUNT 10                                  // cycles to conclude with rapid time for ADR on cold boot
 RTC_DATA_ATTR volatile uint32_t g_sched_override_ms = 0;     //  pending cycle time changes to apply just before sleep
 
-static const uint32_t TX_CYCLE_FAST_TIME = 60000ul;          //  set the fast cycle time that has limited cycles
+static const uint32_t TX_CYCLE_FAST_TIME = 60000ul;  //  set the fast cycle time that has limited cycles
 
-RTC_DATA_ATTR uint32_t inv_m_u32 = 100;                         //  valves: (1/m, b_x10):  1/8 in ch (extra sleve) 190, -2, no sleve (1/4 inch) 100, -130
-RTC_DATA_ATTR int32_t b_x10 = -130;
+RTC_DATA_ATTR uint32_t inv_m_u32 = 346;  //  valves: (1/m, b_x10):  1/8 in ch (extra sleve) 224, -103, no sleve (1/4 inch) 100, -130, or 128, -150...
+RTC_DATA_ATTR int32_t b_x10 = -117;
 RTC_DATA_ATTR uint32_t g_lake_depth_mm = 0;
-RTC_DATA_ATTR char g_name[12] = {0};
+RTC_DATA_ATTR char g_name[12] = { 0 };
+RTC_DATA_ATTR uint32_t g_coldboot_valve_init_done = 0;
+RTC_DATA_ATTR uint16_t g_v0_act_ms = 200;
+RTC_DATA_ATTR uint16_t g_v1_act_ms = 200;
+RTC_DATA_ATTR bool g_v0_open_fwd = true;  // default for legacy nodes
+RTC_DATA_ATTR bool g_v1_open_fwd = true;  // default for legacy nodes
+
+
 uint16_t pressResult = 0;
 
 RTC_DATA_ATTR volatile ValveCmd_t g_cmd;
@@ -155,7 +156,7 @@ bool isTxConfirmed = false;
 #ifdef REED_NODE
 uint8_t appPort = 8;  //  REED_NODE port 8
 #elif defined VALVE_NODE
-uint8_t appPort = 9;  // VALVE_NODE port 9
+uint8_t appPort = 9;                                         // VALVE_NODE port 9
 #elif defined SOIL_SENSOR_NODE
 uint8_t appPort = 11;  // SOIL_PH_SENSOR_NODE port 11
 #elif defined LAKE_NODE
@@ -173,6 +174,23 @@ uint8_t confirmedNbTrials = 4;
 // ValveCmd_t g_cmd; snapshot_cmd(&g_cmd);
 // apply_downlink_snapshot(&g_cmd, &valveState);
 // tick_timers(&valveState);              // your existing decrement/auto-off
+static BoardIdentity boardId;
+bool valve_open_fwd[2] = { true, true };  // defaults = safe
+
+
+bool eink_wait_idle(uint32_t timeout_ms) {
+
+  const bool BUSY_ACTIVE = HIGH;  // DEPG0290 panels pull BUSY high while refreshing
+  uint32_t deadline = millis() + timeout_ms;
+  while (digitalRead(EPD_BUSY_PIN) == BUSY_ACTIVE) {
+    vTaskDelay(pdMS_TO_TICKS(500));  // yield to other tasks (LoRa, etc.)
+
+    if ((int32_t)(millis() - deadline) >= 0) return false;  // timed out
+  }
+  return true;
+}
+
+
 const char *deviceStateToString(eDeviceState_LoraWan s) {
   switch (s) {
     case DEVICE_STATE_INIT: return "DEVICE_STATE_INIT";
@@ -183,6 +201,59 @@ const char *deviceStateToString(eDeviceState_LoraWan s) {
     default: return "DEVICE_STATE_UNKNOWN";
   }
 }
+
+static bool load_lorawan_identity_from_nvs() {
+  Preferences p;
+
+  if (!p.begin(NVS_NS, true)) {  // read-only
+    Serial.println("[NVS] open FAILED");
+    return false;
+  }
+
+  bool provisioned = p.getBool("provisioned", false);
+  if (!provisioned) {
+    Serial.println("[NVS] not provisioned");
+    p.end();
+    return false;
+  }
+
+  uint8_t tmpDevEui[8] = { 0 };
+  uint8_t tmpAppKey[16] = { 0 };
+
+  size_t n1 = p.getBytes("devEui", tmpDevEui, sizeof(tmpDevEui));
+  size_t n2 = p.getBytes("appKey", tmpAppKey, sizeof(tmpAppKey));
+
+  if (n1 != sizeof(tmpDevEui) || n2 != sizeof(tmpAppKey)) {
+    Serial.printf("[NVS] bad sizes: devEui=%u appKey=%u\n",
+                  (unsigned)n1, (unsigned)n2);
+    p.end();
+    return false;
+  }
+
+  // --- NEW: load valve polarity (board-specific physical truth) ---
+  valve_open_fwd[0] = p.getBool("v0_open_fwd", true);
+  valve_open_fwd[1] = p.getBool("v1_open_fwd", true);
+
+  p.end();
+
+  // Overwrite your existing globals (must NOT be const)
+  memcpy(devEui, tmpDevEui, sizeof(tmpDevEui));
+  memcpy(appKey, tmpAppKey, sizeof(tmpAppKey));
+
+  // Sanity prints
+  Serial.print("[NVS] devEui loaded: ");
+  for (int i = 0; i < 8; i++) {
+    Serial.printf("%02X", devEui[i]);
+    if (i < 7) Serial.print(":");
+  }
+  Serial.println();
+
+  Serial.printf("[NVS] valve polarity: v0_open_fwd=%u v1_open_fwd=%u\n",
+                valve_open_fwd[0], valve_open_fwd[1]);
+
+  return true;
+}
+
 
 static inline bool still_awake() {
   return (int32_t)(millis() - g_awake_until_ms) < 0;
@@ -228,26 +299,24 @@ inline uint16_t depth_m_from_raw(int16_t raw) {
 static inline uint32_t choose_cycle_base_ms(void) {
   // keep your existing fast-ADR bursts on cold boot, only when both valves idle
   if ((initialCycleFast > 0) && (valveState->timeA == 0) && (valveState->timeB == 0)) {
-    initialCycleFast--;
-  Serial.print(initialCycleFast);
-  Serial.println(" CycleFast>0, no valves on");
+    Serial.print(initialCycleFast);
+    Serial.println(" CycleFast>0, no valves on");
     return TX_CYCLE_FAST_TIME;
   }
 
   // if either valve has a non-zero timer, use the "valve active" period
   if ((valveState->timeA != 0) || (valveState->timeB != 0)) {
-      Serial.println("valves on");
+    Serial.println("valves on");
     return CYCLE_TIME_VALVE_ON;
   }
 
   // otherwise, use the normal duty cycle
-    Serial.println(" ApxDutyCycle cycle time");
+  Serial.println(" ApxDutyCycle cycle time");
   return appTxDutyCycle;
 }
 
 // Simple scheduler: pick base period, add random dither, program LoRaWAN
-static inline void schedule_next_cycle(void)
-{
+static inline void schedule_next_cycle(void) {
   const uint32_t base_ms = choose_cycle_base_ms();
 
   const int32_t dither_ms = (int32_t)randr(-APP_TX_DUTYCYCLE_RND, APP_TX_DUTYCYCLE_RND);
@@ -255,7 +324,7 @@ static inline void schedule_next_cycle(void)
   if (next_ms < 0) next_ms = 0;
 
   txDutyCycleTime = (uint32_t)next_ms;
-  
+
   Serial.print(txDutyCycleTime);
   Serial.println(" cycle time set...");
 
@@ -343,7 +412,9 @@ void display_status() {
 
 
   //Serial.print("about to display.display \n");
-  display.display();
+  //display.clear();
+
+  display.display();  //  true for a full refresh
 
   // for(int i = 0; i < 25; i++){
   // Serial.printf(" [%2d]: 0x%08X\n", i, RTC_SLOW_MEMORY[i]);
@@ -457,6 +528,7 @@ static void prepareTxFrame(uint8_t port) {
    */
 
   appDataSize = 0;
+  pop_data();
 
 #ifdef REED_NODE
   appData[appDataSize++] = (uint8_t)((RTC_SLOW_MEMORY[ULP_REED_DELTA] >> 8));    //  msb
@@ -581,8 +653,8 @@ void downLinkDataHandle(McpsIndication_t *mcpsIndication) {
                       (unsigned)valveState->latchA,
                       (unsigned)valveState->latchB);
         vTaskDelay(pdMS_TO_TICKS(WAIT_AFTER_VALVE_CHANGE));  //  no Rx window open, let the cpu free
-
-                       //  new data after valve state change and delay, will pop_data as part of SEND
+        pop_data();
+        //  new data after valve state change and delay, will pop_data as part of SEND
         display_status();                 //  display it
         vTaskDelay(pdMS_TO_TICKS(3000));  //  give SPI bus a chance
         deviceState = DEVICE_STATE_SEND;  //  send it
@@ -683,6 +755,52 @@ void downLinkDataHandle(McpsIndication_t *mcpsIndication) {
         }
         Serial.printf("#####lake-depth set: %u (%.3f m) %s\n",
                       depth_mm, depth_mm / 1000.0f, ok ? "stored" : "NVS_FAIL");
+
+        break;
+      }
+
+    case 24:
+      {  // valve config: v0_ms(2) v1_ms(2) flags(1) [reserved(1)]  **BIG-ENDIAN**
+        if (len != 5 && len != 6) {
+          Serial.println("valve-cfg ignored (len!=5/6)");
+          break;
+        }
+
+        uint16_t v0_ms = ((uint16_t)buf[0] << 8) | (uint16_t)buf[1];
+        uint16_t v1_ms = ((uint16_t)buf[2] << 8) | (uint16_t)buf[3];
+        uint8_t flags = buf[4];
+
+        bool v0_fwd = (flags & 0x01) != 0;
+        bool v1_fwd = (flags & 0x02) != 0;
+
+        // Clamp (safety)
+        v0_ms = (v0_ms < 50) ? 50 : (v0_ms > 1000) ? 1000
+                                                   : v0_ms;
+        v1_ms = (v1_ms < 50) ? 50 : (v1_ms > 1000) ? 1000
+                                                   : v1_ms;
+
+        // Apply immediately (RTC vars)
+        g_v0_act_ms = v0_ms;
+        g_v1_act_ms = v1_ms;
+        g_v0_open_fwd = v0_fwd;
+        g_v1_open_fwd = v1_fwd;
+
+        // Persist
+        bool ok = false;
+        if (prefs.begin(NS, false)) {
+          bool ok1 = (prefs.putUShort("v0_act_ms", g_v0_act_ms) == sizeof(uint16_t));
+          bool ok2 = (prefs.putUShort("v1_act_ms", g_v1_act_ms) == sizeof(uint16_t));
+          bool ok3 = prefs.putBool("v0_open_fwd", g_v0_open_fwd);
+          bool ok4 = prefs.putBool("v1_open_fwd", g_v1_open_fwd);
+          prefs.end();
+          ok = ok1 && ok2 && ok3 && ok4;
+        }
+
+        Serial.printf("#####valve-cfg set: v0=%u ms (%s)  v1=%u ms (%s) flags=0x%02X %s\n",
+                      (unsigned)g_v0_act_ms, g_v0_open_fwd ? "FWD" : "REV",
+                      (unsigned)g_v1_act_ms, g_v1_open_fwd ? "FWD" : "REV",
+                      flags,
+                      ok ? "stored" : "NVS_FAIL");
 
         break;
       }
@@ -861,7 +979,9 @@ static void rs485_spin() {
 void setup() {
 
   Serial.begin(115200);
-  delay(500);
+  delay(1000);
+
+  Serial.println("Booting...");
 
   if (g_uiSem == NULL) {
     g_uiSem = xSemaphoreCreateBinary();
@@ -885,6 +1005,7 @@ void setup() {
     }
 
     // simple bus recovery if SDA stuck low
+    pinMode(PIN_SDA, INPUT_PULLUP);   // <-- add this line (re-claim SDA as GPIO)
     pinMode(PIN_SCL, OUTPUT);
     for (int i = 0; i < 9 && digitalRead(PIN_SDA) == LOW; ++i) {
       digitalWrite(PIN_SCL, LOW);
@@ -924,55 +1045,52 @@ void setup() {
   switch (cause) {
     case ESP_SLEEP_WAKEUP_ULP:
       {
-        // ── ULP woke us up
         uint32_t count = read_count32();
-
-        //Serial.printf("Woke by ULP reed trigger, pulse count = %u\n", count);
+        (void)count;
         xSemaphoreGive(g_uiSem);
       }
       break;
 
     case ESP_SLEEP_WAKEUP_TIMER:
       {
-        // ── timer woke us up
         uint32_t count = read_count32();
+        if (initialCycleFast > 0) {
+          initialCycleFast--;
+        }
         Serial.printf("Woke by RTC TIMER, pulse count = %u\n", count);
         xSemaphoreGive(g_uiSem);
       }
       break;
 
-    case ESP_SLEEP_WAKEUP_UNDEFINED:  //  THIS IS COLD RESTART
-      {
-        //  init cycles_fast cycles one on cold boot
-        initialCycleFast = FAST_BURST_COUNT;  // seed
+    case ESP_SLEEP_WAKEUP_UNDEFINED:
+      {  // THIS IS COLD RESTART
+        Serial.printf("WAKEUP_BY_RESTART:::\n");
+        // --- Try loading LoRaWAN identity from NVS ---
+        bool nvs_ok = load_lorawan_identity_from_nvs();
 
-        TxDutyCycle_hold = appTxDutyCycle;  //  appTxDutyCycle should be sssigned before this point at the top of this code
-                                            //display.display();
+        if (nvs_ok) {
+          Serial.println("[NVS] LoRaWAN identity loaded from NVS");
+        } else {
+          Serial.println("[NVS] Using compiled-in LoRaWAN keys");
+        }
+        initialCycleFast = FAST_BURST_COUNT;
+
+        TxDutyCycle_hold = appTxDutyCycle;
         xSemaphoreGive(g_uiSem);
 
         valveState->onA = 0;
-        valveState->onB = 0;  // e.g., set to 0
-
-#ifdef VALVE_NODE  // start with valves sent a close command.
-        valveState->onA = 0;
-        valveState->onB = 0;  // e.g., set to 0
-        controlValve(0, 0);
-        delay(250);  //  let the cap charge for the next valve action
-        controlValve(1, 0);
-#endif
+        valveState->onB = 0;
 
         memset(RTC_SLOW_MEM, 0, CONFIG_ULP_COPROC_RESERVE_MEM);
 
-        // --- NEW: prefs restores (keep namespaces/keys from your newer version)
-        if (prefs.begin(NS, /*readOnly=*/true)) {
-          // lake depth (uint16 mm)
+        // prefs restores + self-heal defaults (single open)
+        if (prefs.begin(NS, /*readOnly=*/false)) {
+
           g_lake_depth_mm = prefs.getUShort(K_LAKE_MM, g_lake_depth_mm);
 
-          // wake threshold → ULP
           uint16_t th = prefs.getUShort(K_WAKE_TH, PULSE_THRESHOLD);
           RTC_SLOW_MEMORY[ULP_WAKE_THRESHOLD] = th;
 
-          // screen name (<=12 chars)
           char tmp[13] = {};
           prefs.getString(K_NAME, tmp, sizeof(tmp));
           if (tmp[0]) {
@@ -980,22 +1098,59 @@ void setup() {
             g_name[sizeof(g_name) - 1] = '\0';
           }
 
-          // calibration (u32 / s32)
           inv_m_u32 = prefs.getUInt(K_INV_M, inv_m_u32);
           b_x10 = prefs.getInt(K_BX10, b_x10);
+
+          if (!prefs.isKey("v0_act_ms")) prefs.putUShort("v0_act_ms", g_v0_act_ms);
+          if (!prefs.isKey("v1_act_ms")) prefs.putUShort("v1_act_ms", g_v1_act_ms);
+
+          g_v0_act_ms = prefs.getUShort("v0_act_ms", g_v0_act_ms);
+          g_v1_act_ms = prefs.getUShort("v1_act_ms", g_v1_act_ms);
+
           prefs.end();
         }
-        if (!inv_m_u32) inv_m_u32 = 1;  // guard div-by-zero
+
+        // clamp to sane limits
+        g_v0_act_ms = (g_v0_act_ms < 50) ? 50 : (g_v0_act_ms > 1000) ? 1000
+                                                                     : g_v0_act_ms;
+        g_v1_act_ms = (g_v1_act_ms < 50) ? 50 : (g_v1_act_ms > 1000) ? 1000
+                                                                     : g_v1_act_ms;
+
+        if (!inv_m_u32) inv_m_u32 = 1;
+
+        Serial.printf("Valve activation loaded: v0=%u ms  v1=%u ms\n",
+                      (unsigned)g_v0_act_ms, (unsigned)g_v1_act_ms);
 
         Serial.printf("lake-depth init: %u (%.3f m)\n", g_lake_depth_mm, g_lake_depth_mm / 1000.0f);
         Serial.printf("ULP_WAKE_THRESHOLD loaded: %u\n", (unsigned)RTC_SLOW_MEMORY[ULP_WAKE_THRESHOLD]);
-        Serial.printf("Calib restored: inv_m=%u cnt/m  b=%.1f m\n", (unsigned)inv_m_u32, b_x10 / 10.0f);
+        Serial.printf("Calib restored: inv_m=%u cnt/m  b=%.1f m\n",
+                      (unsigned)inv_m_u32, b_x10 / 10.0f);
 
-        // Load & start ULP program (unchanged from your working template)
         size_t sz = sizeof(ulp_program) / sizeof(ulp_insn_t);
         esp_err_t r = ulp_process_macros_and_load(ULP_PROG_START, ulp_program, &sz);
         Serial.printf("load - %s, %u instructions\n", esp_err_to_name(r), (unsigned)sz);
         ESP_ERROR_CHECK(ulp_run(ULP_PROG_START));
+
+#if defined(VALVE_NODE)
+        if (g_coldboot_valve_init_done == 0) {
+          for (int t = 0; t < 1; t++) {
+            delay(500);
+            Serial.printf("set valves to on (cycle %d)...\n", t + 1);
+            controlValve(0, 1);
+            delay(500);
+            controlValve(1, 1);
+            delay(500);
+            Serial.printf("set valves to off (cycle %d/2)...\n", t + 1);
+            controlValve(0, 0);
+            delay(500);
+            controlValve(1, 0);
+          }
+          delay(3000);
+          g_coldboot_valve_init_done = 1;
+        } else {
+          Serial.println("valve init skipped (already done this power-up)");
+        }
+#endif
       }
       break;
 
@@ -1006,7 +1161,8 @@ void setup() {
         xSemaphoreGive(g_uiSem);
       }
       break;
-  }  // case
+  }  // end switch(cause)
+
 
   static uint16_t loop_count = 0;
   static uint16_t raw_pressure = 0;
@@ -1063,7 +1219,6 @@ void setup() {
   if (!adc.begin(ADC_ADDR, &Wire)) {
     Serial.println("MCP3421 not found on Wire");
   } else Serial.println("MCP3421 found");
-
 };  // of setup function
 
 

@@ -22,6 +22,10 @@ static const uint16_t REG_COUNT = 1;       // read one 16-bit register
 extern uint32_t TxDutyCycle_hold;
 extern uint32_t appTxDutyCycle;
 extern uint32_t txDutyCycleTime;
+extern uint16_t g_v0_act_ms;
+extern uint16_t g_v1_act_ms;
+extern bool g_v0_open_fwd;   // default for legacy nodes
+extern bool g_v1_open_fwd;  // default for legacy nodes
 // Modbus master instance
 
 #define RS485_SERIAL Serial1
@@ -84,46 +88,89 @@ static const uint8_t reversePins[] = { PIN_IN2, PIN_IN4 };
 // static const uint8_t reversePins[] = { PIN_IN1, PIN_IN3 };
 
 static const size_t valveCount = sizeof(forwardPins) / sizeof(forwardPins[0]);
+static inline void drv8871_coast(uint8_t in1, uint8_t in2) {
+  digitalWrite(in1, LOW);
+  digitalWrite(in2, LOW);
+}
+
+static inline void drv8871_drive(uint8_t in1, uint8_t in2, uint8_t status) {
+  // status==1 => forward, status==0 => reverse (your original meaning)
+  digitalWrite(in1, status ? HIGH : LOW);
+  digitalWrite(in2, status ? LOW : HIGH);
+}
 
 void controlValve(uint8_t valve_number, uint8_t status) {
   if (valve_number >= valveCount) return;
 
+  // Physical pins for this valve (do NOT change)
   const uint8_t pinF = forwardPins[valve_number];
   const uint8_t pinR = reversePins[valve_number];
-  vTaskDelay(pdMS_TO_TICKS(1000));                       //  allows recovery of capacitor if both valves are actuated 
-  // drive for the pulse
-  digitalWrite(pinF, status ? HIGH : LOW);  // 1=ON, 0=OFF
-  digitalWrite(pinR, status ? LOW : HIGH);
 
-  delay(VALVE_PULSE_MS);
+  // Determine which direction corresponds to "OPEN" for this valve
+  const bool open_is_fwd = (valve_number == 0) ? g_v0_open_fwd : g_v1_open_fwd;
 
-  // release to LOW (coast) for drv 8871
-  digitalWrite(pinF, LOW);  //
-  digitalWrite(pinR, LOW);  //
+  // We interpret status: 1=open, 0=close
+  // drv8871_drive(..., dir) expects dir==1 => forward, dir==0 => reverse
+  const uint8_t drive_dir = status ? (open_is_fwd ? 1 : 0) : (open_is_fwd ? 0 : 1);
+
+  // If you have exactly 2 valves, identify the other one and force it to COAST
+  const uint8_t other = (valve_number == 0) ? 1 : 0;
+  if (other < valveCount) {
+    drv8871_coast(forwardPins[other], reversePins[other]);
+  }
+
+  // Allow recovery of capacitor / 9V rail
+  vTaskDelay(pdMS_TO_TICKS(1000));
+
+  // HARD COAST this channel first (clean start)
+  drv8871_coast(pinF, pinR);
+  delay(10);
+
+  // MAIN PULSE
+  drv8871_drive(pinF, pinR, drive_dir);
+
+  uint16_t pulse_ms = (valve_number == 0) ? g_v0_act_ms : g_v1_act_ms;
+  delay(pulse_ms);
+
+  // Coast after pulse
+  drv8871_coast(pinF, pinR);
 }
 
-// return a 8 bit '% charged' that is  proportional to the range of voltages from 3.5 to 4.1
-uint8_t bat_cap8() {
-  const int16_t mid = 850;
-  const int16_t span = 150;  // 1000–850
 
+
+// return an 8-bit '% charged' proportional to 3.1–4.1 V (linear)
+uint8_t bat_cap8() {
   Serial.print("in bat_cap8()\n");
+
   digitalWrite(ADC_CTL_PIN, HIGH);
   delay(40);
   uint16_t raw = analogRead(VBAT_READ_PIN);
-  //Serial.printf("read bat_cap8() pin_adc_ctl HIGH = %u\n", raw);
   digitalWrite(ADC_CTL_PIN, LOW);
 
-  int16_t diff = raw - mid;    // –∞…+∞
-  if (diff < 0) diff = -diff;  // abs(diff)
-  uint16_t udiff = (uint16_t)diff;
-  // now scale 0…150 → 0…100
-  uint16_t pct = uint16_t(diff * 100 / span);
-  if (pct > 100) pct = 100;  // clamp
+  // Clamp raw ADC into calibrated range
+  if (raw <= ADC_RAW_3V1) {
+    RTC_SLOW_MEM[ULP_BAT_PCT] = 0;
+    return 0;
+  }
 
-  RTC_SLOW_MEM[ULP_BAT_PCT] = pct;  //  ULP_BAT_PCT is defined in the .h
-  return ((uint8_t)(pct * 2.55));   //  lorawan.cpp wants this full byte form
+  if (raw >= ADC_RAW_4V1) {
+    RTC_SLOW_MEM[ULP_BAT_PCT] = 100;
+    return 255;
+  }
+
+  // Linear map: [ADC_RAW_3V1 .. ADC_RAW_4V1] → [0 .. 100]
+  uint16_t pct =
+      (uint16_t)(((uint32_t)(raw - ADC_RAW_3V1) * 100U) /
+                 (uint32_t)(ADC_RAW_4V1 - ADC_RAW_3V1));
+
+  if (pct > 100) pct = 100;
+
+  RTC_SLOW_MEM[ULP_BAT_PCT] = pct;
+
+  // Return 0..255 for LoRaWAN (rounded)
+  return (uint8_t)((pct * 255U + 50U) / 100U);
 }
+
 
 // Replaces your readMCP3421avg_cont() with error handling and timeouts.
 uint16_t readMCP3421avg_cont() {
@@ -417,7 +464,7 @@ uint16_t readDepthSensor(unsigned long timeout_ms = 400, uint8_t max_tries = 7) 
   }
 
   //const uint8_t req[8] = { 0x01, 0x03, 0x00, 0x04, 0x00, 0x01, 0xC5, 0xCB };
-    const uint8_t req[8] = { 0x01, 0x03, 0x00, 0x04, 0x00, 0x01, 0xc5, 0xcb };    //  for the second 2 metor sensor
+  const uint8_t req[8] = { 0x01, 0x03, 0x00, 0x04, 0x00, 0x01, 0xc5, 0xcb };  //  for the second 2 metor sensor
 
   for (uint8_t attempt = 1; attempt <= max_tries; ++attempt) {
     // purge RX
@@ -571,7 +618,7 @@ inline uint32_t addJitterClampMin(uint32_t base_ms, int32_t jitter_ms, uint32_t 
 // Uses globals: TxDutyCycle_hold, appTxDutyCycle, txDutyCycleTime
 // Assumes CYCLE_TIME_VALVE_ON is in milliseconds (same units as appTxDutyCycle).
 void scheduleValveOnCycle(void) {
-  TxDutyCycle_hold = appTxDutyCycle;     // save current
-  appTxDutyCycle = CYCLE_TIME_VALVE_ON;  // switch to valve-on cycle
-  txDutyCycleTime = addJitterClampMin( appTxDutyCycle, randr( -APP_TX_DUTYCYCLE_RND, APP_TX_DUTYCYCLE_RND), 10u * 60000u );  // hard floor: 10 minutes
+  TxDutyCycle_hold = appTxDutyCycle;                                                                                      // save current
+  appTxDutyCycle = CYCLE_TIME_VALVE_ON;                                                                                   // switch to valve-on cycle
+  txDutyCycleTime = addJitterClampMin(appTxDutyCycle, randr(-APP_TX_DUTYCYCLE_RND, APP_TX_DUTYCYCLE_RND), 10u * 60000u);  // hard floor: 10 minutes
 }
