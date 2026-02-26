@@ -51,6 +51,29 @@ constexpr const char *K_NAME = "screenMsg";
 constexpr const char *K_INV_M = "inv_m_u32";
 constexpr const char *K_BX10 = "b_x10";
 constexpr const char *NVS_NS = "lorawan";  //  for nvs storage of devEui and appKey
+constexpr const char *K_SCHEMA = "schema_ver";
+constexpr const char *K_ROLE = "device_role";
+constexpr const char *K_FPORT = "uplink_fport";
+constexpr const char *K_LAKE_TYP = "lake_type";
+
+// Valve keys stored in cfg (per your decision B)
+constexpr const char *K_V0_ACT = "v0_act_ms";
+constexpr const char *K_V1_ACT = "v1_act_ms";
+constexpr const char *K_V0_FWD = "v0_open_fwd";
+constexpr const char *K_V1_FWD = "v1_open_fwd";
+
+// ---- schema control ----
+constexpr uint8_t CFG_SCHEMA_VERSION = 1;
+
+// ---- device roles (must match provisioning values) ----
+constexpr uint8_t ROLE_LAKE = 1;
+constexpr uint8_t ROLE_VALVE = 2;
+constexpr uint8_t ROLE_METER = 3;
+constexpr uint8_t ROLE_TEST = 4;
+constexpr uint8_t ROLE_SOIL_AIR = 5;
+constexpr uint8_t ROLE_SOIL = 6;
+
+//  semaphjore for the screen
 SemaphoreHandle_t g_uiSem;
 
 volatile ValveState_t *valveState = RTC_SLOW_STRUCT_PTR(ValveState_t, ULP_VALVE_A);
@@ -133,7 +156,11 @@ RTC_DATA_ATTR uint16_t g_v0_act_ms = 200;
 RTC_DATA_ATTR uint16_t g_v1_act_ms = 200;
 RTC_DATA_ATTR bool g_v0_open_fwd = true;  // default for legacy nodes
 RTC_DATA_ATTR bool g_v1_open_fwd = true;  // default for legacy nodes
-
+RTC_DATA_ATTR uint8_t g_device_role = 0;
+RTC_DATA_ATTR uint8_t g_uplink_fport = 0;
+RTC_DATA_ATTR uint8_t g_lake_type = 0;
+RTC_DATA_ATTR uint8_t g_schema_ver = 0;
+uint8_t appPort = 0;  // set on cold boot from cfg/uplink_fport
 
 uint16_t pressResult = 0;
 
@@ -151,19 +178,6 @@ bool loraWanAdr = true;
 
 /* Indicates if the node is sending confirmed or unconfirmed messages */
 bool isTxConfirmed = false;
-
-/* Application port */
-#ifdef REED_NODE
-uint8_t appPort = 8;  //  REED_NODE port 8
-#elif defined VALVE_NODE
-uint8_t appPort = 9;                                         // VALVE_NODE port 9
-#elif defined SOIL_SENSOR_NODE
-uint8_t appPort = 11;  // SOIL_PH_SENSOR_NODE port 11
-#elif defined LAKE_NODE
-uint8_t appPort = 12;  // LAKE_NODE port 12
-#else
-#error "Define a node type in the list REED_NODE, VALVE_NODE, SOIL_SENSOR_NODE, LAKE_NODE"
-#endif
 
 // * Note, that if NbTrials is set to 1 or 2, the MAC will not decrease
 // * the datarate, in case the LoRaMAC layer did not receive an acknowledgment
@@ -353,62 +367,61 @@ void display_status() {
   display.drawString(60, 100, g_name);  //  screen name
 
 
-#ifdef VALVE_NODE
-  display.drawLine(0, 25, 120, 25);
-  display.drawLine(150, 25, 270, 25);
-  display.drawString(60, 0, "valve");
-  show_vlv_status(0);
-  display.drawString(60, 40, buffer);
-  show_vlv_status(1);
-  display.drawString(60, 65, buffer);
-  snprintf(buffer, sizeof(buffer), "%.1f psi", float(pressResult / 100));
-  display.drawString(210, 0, buffer);
-#endif
-
-#ifdef REED_NODE
-  display.drawLine(0, 25, 80, 25);
-  display.drawLine(95, 25, 300, 25);
-  display.drawString(80, 0, "interval  total c");
-  snprintf(buffer, sizeof(buffer), "%u gal/m", (uint32_t)(RTC_SLOW_MEMORY[ULP_FLOW_RATE]));
-  display.drawString(60, 35, buffer);
-  snprintf(buffer, sizeof(buffer), "%u gal", (uint32_t)(RTC_SLOW_MEMORY[ULP_VOLUME_DELTA]));
-  display.drawString(60, 65, buffer);
-  uint32_t count = read_count32();
-  snprintf(buffer, sizeof(buffer), "%lu", count);  // counter
-  display.drawString(220, 0, buffer);
-  display.setFont(ArialMT_Plain_16);
-  snprintf(buffer, sizeof(buffer), "reed/wake: %lu", RTC_SLOW_MEMORY[ULP_WAKE_THRESHOLD]);  // reed closures per wake cycle
-  display.drawString(210, 30, buffer);
-#endif
-
-#ifdef SOIL_SENSOR_NODE
-  display.setFont(ArialMT_Plain_16);
-  display.drawString(60, 0, "Soil s, d");
-  if (soilSensorOut[0] || soilSensorOut[3]) {
-    snprintf(buffer, sizeof(buffer), "H20%% %u,  %u", soilSensorOut[0], soilSensorOut[3]);
-    display.drawString(60, 30, buffer);
+  if (g_device_role == ROLE_VALVE) {
+    display.drawLine(0, 25, 120, 25);
+    display.drawLine(150, 25, 270, 25);
+    display.drawString(60, 0, "valve");
+    show_vlv_status(0);
+    display.drawString(60, 40, buffer);
+    show_vlv_status(1);
+    display.drawString(60, 65, buffer);
+    snprintf(buffer, sizeof(buffer), "%.1f psi", float(pressResult / 100));
+    display.drawString(210, 0, buffer);
   }
-  if (soilSensorOut[1] || soilSensorOut[4]) {
-    snprintf(buffer, sizeof(buffer), "degC %u, %u", soilSensorOut[1], soilSensorOut[4]);
-    display.drawString(60, 50, buffer);
+
+  if (g_device_role == ROLE_METER) {
+    display.drawLine(0, 25, 80, 25);
+    display.drawLine(95, 25, 300, 25);
+    display.drawString(80, 0, "interval  total c");
+    snprintf(buffer, sizeof(buffer), "%u gal/m", (uint32_t)(RTC_SLOW_MEMORY[ULP_FLOW_RATE]));
+    display.drawString(60, 35, buffer);
+    snprintf(buffer, sizeof(buffer), "%u gal", (uint32_t)(RTC_SLOW_MEMORY[ULP_VOLUME_DELTA]));
+    display.drawString(60, 65, buffer);
+    uint32_t count = read_count32();
+    snprintf(buffer, sizeof(buffer), "%lu", count);  // counter
+    display.drawString(220, 0, buffer);
+    display.setFont(ArialMT_Plain_16);
+    snprintf(buffer, sizeof(buffer), "reed/wake: %lu", RTC_SLOW_MEMORY[ULP_WAKE_THRESHOLD]);  // reed closures per wake cycle
+    display.drawString(210, 30, buffer);
   }
-  if (soilSensorOut[2] || soilSensorOut[5]) {
-    snprintf(buffer, sizeof(buffer), "pH %.1f, %.1f", (float)soilSensorOut[2] / 10, (float)soilSensorOut[5] / 10);  //
-    display.drawString(60, 70, buffer);
+
+  if (g_device_role == ROLE_SOIL) {
+    display.setFont(ArialMT_Plain_16);
+    display.drawString(60, 0, "Soil s, d");
+    if (soilSensorOut[0] || soilSensorOut[3]) {
+      snprintf(buffer, sizeof(buffer), "H20%% %u,  %u", soilSensorOut[0], soilSensorOut[3]);
+      display.drawString(60, 30, buffer);
+    }
+    if (soilSensorOut[1] || soilSensorOut[4]) {
+      snprintf(buffer, sizeof(buffer), "degC %u, %u", soilSensorOut[1], soilSensorOut[4]);
+      display.drawString(60, 50, buffer);
+    }
+    if (soilSensorOut[2] || soilSensorOut[5]) {
+      snprintf(buffer, sizeof(buffer), "pH %.1f, %.1f", (float)soilSensorOut[2] / 10, (float)soilSensorOut[5] / 10);  //
+      display.drawString(60, 70, buffer);
+    }
   }
-#endif
 
-#ifdef LAKE_NODE
-  // --- Lake depth display (calibrated meters), uplink remains uncalibrated ---
-  // RTC carries last pressResult
+  if (g_device_role == ROLE_LAKE) {
+    // --- Lake depth display (calibrated meters), uplink remains uncalibrated ---
+    // RTC carries last pressResult
 
-  uint16_t depth_m = depth_m_from_raw(pressResult);
+    uint16_t depth_m = depth_m_from_raw(pressResult);
 
-  display.setFont(ArialMT_Plain_24);
-  snprintf(buffer, sizeof(buffer), "Depth: %.3f", float(depth_m / 100));
-  display.drawString(120, 30, buffer);
-
-#endif
+    display.setFont(ArialMT_Plain_24);
+    snprintf(buffer, sizeof(buffer), "Depth: %.3f", float(depth_m / 100));
+    display.drawString(120, 30, buffer);
+  }
 
 
   //Serial.print("about to display.display \n");
@@ -442,77 +455,75 @@ void pop_data(void) {
 
   (void)bat_cap8();
 
-#ifdef VALVE_NODE
-  if (i2c_ready) {
-    pressResult = depth_m_from_raw(readMCP3421avg_cont());
+  if (g_device_role == ROLE_VALVE) {
+    if (i2c_ready) {
+      pressResult = depth_m_from_raw(readMCP3421avg_cont());
+      wPres[0] = (pressResult >> 8);
+      wPres[1] = (pressResult & 0xFF);
+      Serial.printf("pressure result 1, 2 %u, %u\n", wPres[0], wPres[1]);
+    } else {
+      // optional fallback: zero
+      wPres[0] = wPres[1] = 0;
+      Serial.printf("pressure result fallback to zero \n");
+    }
+  }
+
+
+  if (g_device_role == ROLE_METER) {
+
+    uint32_t count = read_count32();  //  guards against the change of the upper 16 bits
+    uint16_t lo = (uint16_t)RTC_SLOW_MEMORY[ULP_COUNT_LO];
+    uint16_t last = (uint16_t)RTC_SLOW_MEMORY[ULP_LAST_SENT];
+    uint16_t diff = (uint16_t)(lo - last);  // modulo-16, safe across wrap
+
+    //  reed count delta FROM rtc , low two bytes only
+    Serial.printf("ULP_COUNT %lu \n", count);
+    Serial.printf("ULP_LAST_SENT %lu \n", RTC_SLOW_MEMORY[ULP_LAST_SENT]);
+
+    RTC_SLOW_MEMORY[ULP_REED_DELTA] = diff;  // used in display screen
+    RTC_SLOW_MEMORY[ULP_LAST_SENT] = lo;     // advance marker
+    Serial.printf("ULP_TS_DELTA_TICK_POP %lu \n", RTC_SLOW_MEMORY[ULP_TS_DELTA_TICK_POP]);
+    Serial.printf("ULP_REED_DELTA %lu \n", RTC_SLOW_MEMORY[ULP_REED_DELTA]);
+    //  flow calc stored in RTC_SLOW_MEMORY[ULP_FLOW_RATE]
+    //  if ULP_TICK_POP <> 0 or no reed delta, then flow is zero
+    uint32_t ticks_delta = (((uint32_t)((uint16_t)RTC_SLOW_MEMORY[ULP_TS_DELTA_HI] << 16)) | (uint16_t)(RTC_SLOW_MEMORY[ULP_TS_DELTA_LO]));
+    if (diff && ticks_delta) {
+
+      RTC_SLOW_MEMORY[ULP_FLOW_RATE] = (uint32_t)(((uint64_t)VOLUME_PER_TICK * (uint64_t)TICKS_PER_MIN) / (uint64_t)ticks_delta);
+    } else {
+      RTC_SLOW_MEMORY[ULP_FLOW_RATE] = 0;
+    }
+    Serial.printf("ticks_delta %lu \n", ticks_delta);
+    //  only determine rate if the delta_tick_pop is not set (indicates that the timer has overflowed) and if the reed count has changed
+    if ((RTC_SLOW_MEMORY[ULP_TS_DELTA_TICK_POP]) || (RTC_SLOW_MEMORY[ULP_REED_DELTA] == 0)) {
+
+      RTC_SLOW_MEMORY[ULP_VOLUME_DELTA] = 0;
+    } else {
+      uint32_t vol = (uint32_t)(((uint64_t)diff * (uint64_t)VOLUME_PER_TICK) & 0xFFFFFFFFu);
+      RTC_SLOW_MEMORY[ULP_VOLUME_DELTA] = vol;  // or clamp if you prefer
+    }
+    RTC_SLOW_MEMORY[ULP_TS_DELTA_TICK_POP] = 0x0000;  //  clear the pop flag here, so we can see if the timer pops off again
+  }
+
+  if (g_device_role == ROLE_SOIL) {
+    uint8_t buf[64];
+    if (readModbusFrame(0x01, 0x0001, 2, buf, sizeof(buf), 9600, 120)) {
+      uint16_t reg0 = (buf[3] << 8) | buf[4];  // temp?
+      uint16_t reg1 = (buf[5] << 8) | buf[6];  // moisture?
+    }
+    if (readModbusFrame(0x02, 0x0001, 2, buf, sizeof(buf), 9600, 120)) {
+      uint16_t reg0 = (buf[3] << 8) | buf[4];  // temp?
+      uint16_t reg1 = (buf[5] << 8) | buf[6];  // moisture?
+    }
+  }
+
+  if (g_device_role == ROLE_LAKE) {
+    delay(100);  //  allow sensor to stabilize
+    uint16_t lakeResult = readDepthSensor(200, 7);
+    pressResult = depth_m_from_raw(lakeResult);
     wPres[0] = (pressResult >> 8);
     wPres[1] = (pressResult & 0xFF);
-    Serial.printf("pressure result 1, 2 %u, %u\n", wPres[0], wPres[1]);
-  } else {
-    // optional fallback: zero
-    wPres[0] = wPres[1] = 0;
-    Serial.printf("pressure result fallback to zero \n");
   }
-#endif
-
-
-#ifdef REED_NODE
-
-  uint32_t count = read_count32();  //  guards against the change of the upper 16 bits
-  uint16_t lo = (uint16_t)RTC_SLOW_MEMORY[ULP_COUNT_LO];
-  uint16_t last = (uint16_t)RTC_SLOW_MEMORY[ULP_LAST_SENT];
-  uint16_t diff = (uint16_t)(lo - last);  // modulo-16, safe across wrap
-
-  //  reed count delta FROM rtc , low two bytes only
-  Serial.printf("ULP_COUNT %lu \n", count);
-  Serial.printf("ULP_LAST_SENT %lu \n", RTC_SLOW_MEMORY[ULP_LAST_SENT]);
-
-  RTC_SLOW_MEMORY[ULP_REED_DELTA] = diff;  // used in display screen
-  RTC_SLOW_MEMORY[ULP_LAST_SENT] = lo;     // advance marker
-  Serial.printf("ULP_TS_DELTA_TICK_POP %lu \n", RTC_SLOW_MEMORY[ULP_TS_DELTA_TICK_POP]);
-  Serial.printf("ULP_REED_DELTA %lu \n", RTC_SLOW_MEMORY[ULP_REED_DELTA]);
-  //  flow calc stored in RTC_SLOW_MEMORY[ULP_FLOW_RATE]
-  //  if ULP_TICK_POP <> 0 or no reed delta, then flow is zero
-  uint32_t ticks_delta = (((uint32_t)((uint16_t)RTC_SLOW_MEMORY[ULP_TS_DELTA_HI] << 16)) | (uint16_t)(RTC_SLOW_MEMORY[ULP_TS_DELTA_LO]));
-  if (diff && ticks_delta) {
-
-    RTC_SLOW_MEMORY[ULP_FLOW_RATE] = (uint32_t)(((uint64_t)VOLUME_PER_TICK * (uint64_t)TICKS_PER_MIN) / (uint64_t)ticks_delta);
-  } else {
-    RTC_SLOW_MEMORY[ULP_FLOW_RATE] = 0;
-  }
-  Serial.printf("ticks_delta %lu \n", ticks_delta);
-  //  only determine rate if the delta_tick_pop is not set (indicates that the timer has overflowed) and if the reed count has changed
-  if ((RTC_SLOW_MEMORY[ULP_TS_DELTA_TICK_POP]) || (RTC_SLOW_MEMORY[ULP_REED_DELTA] == 0)) {
-
-    RTC_SLOW_MEMORY[ULP_VOLUME_DELTA] = 0;
-  } else {
-    uint32_t vol = (uint32_t)(((uint64_t)diff * (uint64_t)VOLUME_PER_TICK) & 0xFFFFFFFFu);
-    RTC_SLOW_MEMORY[ULP_VOLUME_DELTA] = vol;  // or clamp if you prefer
-  }
-  RTC_SLOW_MEMORY[ULP_TS_DELTA_TICK_POP] = 0x0000;  //  clear the pop flag here, so we can see if the timer pops off again
-
-#endif
-
-#ifdef SOIL_SENSOR_NODE
-  uint8_t buf[64];
-  if (readModbusFrame(0x01, 0x0001, 2, buf, sizeof(buf), 9600, 120)) {
-    uint16_t reg0 = (buf[3] << 8) | buf[4];  // temp?
-    uint16_t reg1 = (buf[5] << 8) | buf[6];  // moisture?
-  }
-  if (readModbusFrame(0x02, 0x0001, 2, buf, sizeof(buf), 9600, 120)) {
-    uint16_t reg0 = (buf[3] << 8) | buf[4];  // temp?
-    uint16_t reg1 = (buf[5] << 8) | buf[6];  // moisture?
-  }
-#endif
-
-#ifdef LAKE_NODE
-  delay(100);  //  allow sensor to stabilize
-  uint16_t lakeResult = readDepthSensor(200, 7);
-  pressResult = depth_m_from_raw(lakeResult);
-  wPres[0] = (pressResult >> 8);
-  wPres[1] = (pressResult & 0xFF);
-
-#endif
 
   //xSemaphoreGive(g_uiSem);
 }
@@ -530,47 +541,47 @@ static void prepareTxFrame(uint8_t port) {
   appDataSize = 0;
   pop_data();
 
-#ifdef REED_NODE
-  appData[appDataSize++] = (uint8_t)((RTC_SLOW_MEMORY[ULP_REED_DELTA] >> 8));    //  msb
-  appData[appDataSize++] = (uint8_t)((RTC_SLOW_MEMORY[ULP_REED_DELTA] & 0xff));  //  lsb
-  appData[appDataSize++] = (uint8_t)((RTC_SLOW_MEMORY[ULP_FLOW_RATE] >> 8));     //  msb
-  appData[appDataSize++] = (uint8_t)((RTC_SLOW_MEMORY[ULP_FLOW_RATE] & 0xff));   //  lsb
-  appData[appDataSize++] = (uint8_t)((RTC_SLOW_MEMORY[ULP_COUNT_HI] >> 8));      //  msb
-  appData[appDataSize++] = (uint8_t)((RTC_SLOW_MEMORY[ULP_COUNT_HI] & 0xff));    //  lsb
-  appData[appDataSize++] = (uint8_t)((RTC_SLOW_MEMORY[ULP_COUNT_LO] >> 8));      //  msb
-  appData[appDataSize++] = (uint8_t)((RTC_SLOW_MEMORY[ULP_COUNT_LO] & 0xff));    //  lsb
-  appData[appDataSize++] = (uint8_t)((RTC_SLOW_MEMORY[ULP_BAT_PCT] & 0xff));     //
-#endif
+  if (g_device_role == ROLE_METER) {
+    appData[appDataSize++] = (uint8_t)((RTC_SLOW_MEMORY[ULP_REED_DELTA] >> 8));    //  msb
+    appData[appDataSize++] = (uint8_t)((RTC_SLOW_MEMORY[ULP_REED_DELTA] & 0xff));  //  lsb
+    appData[appDataSize++] = (uint8_t)((RTC_SLOW_MEMORY[ULP_FLOW_RATE] >> 8));     //  msb
+    appData[appDataSize++] = (uint8_t)((RTC_SLOW_MEMORY[ULP_FLOW_RATE] & 0xff));   //  lsb
+    appData[appDataSize++] = (uint8_t)((RTC_SLOW_MEMORY[ULP_COUNT_HI] >> 8));      //  msb
+    appData[appDataSize++] = (uint8_t)((RTC_SLOW_MEMORY[ULP_COUNT_HI] & 0xff));    //  lsb
+    appData[appDataSize++] = (uint8_t)((RTC_SLOW_MEMORY[ULP_COUNT_LO] >> 8));      //  msb
+    appData[appDataSize++] = (uint8_t)((RTC_SLOW_MEMORY[ULP_COUNT_LO] & 0xff));    //  lsb
+    appData[appDataSize++] = (uint8_t)((RTC_SLOW_MEMORY[ULP_BAT_PCT] & 0xff));     //
+  }
 
-#ifdef VALVE_NODE
-  appData[appDataSize++] = wPres[0];                      //  msb (* 100)
-  appData[appDataSize++] = wPres[1];                      //  lsb
-  appData[appDataSize++] = (uint8_t)(valveState->timeA);  //  valve A
-  appData[appDataSize++] = (uint8_t)(valveState->timeB);  //  valve B
-  uint8_t flags =
-    ((valveState->onA ? 1 : 0)) |                                             // bit0
-    ((valveState->onB ? 1 : 0) << 1) |                                        // bit1
-    ((valveState->latchA ? 1 : 0) << 2) |                                     // bit2
-    ((valveState->latchB ? 1 : 0) << 3);                                      // bit3
-  appData[appDataSize++] = flags;                                             // NEW: latch/ON bits
-  appData[appDataSize++] = (uint8_t)((RTC_SLOW_MEMORY[ULP_BAT_PCT] & 0xff));  //
-#endif
+  if (g_device_role == ROLE_VALVE) {
+    appData[appDataSize++] = wPres[0];                      //  msb (* 100)
+    appData[appDataSize++] = wPres[1];                      //  lsb
+    appData[appDataSize++] = (uint8_t)(valveState->timeA);  //  valve A
+    appData[appDataSize++] = (uint8_t)(valveState->timeB);  //  valve B
+    uint8_t flags =
+      ((valveState->onA ? 1 : 0)) |                                             // bit0
+      ((valveState->onB ? 1 : 0) << 1) |                                        // bit1
+      ((valveState->latchA ? 1 : 0) << 2) |                                     // bit2
+      ((valveState->latchB ? 1 : 0) << 3);                                      // bit3
+    appData[appDataSize++] = flags;                                             // NEW: latch/ON bits
+    appData[appDataSize++] = (uint8_t)((RTC_SLOW_MEMORY[ULP_BAT_PCT] & 0xff));  //
+  }
 
-#ifdef SOIL_SENSOR_NODE
-  appData[appDataSize++] = (uint8_t)(soilSensorOut[0]);                       //  moist shallow
-  appData[appDataSize++] = (uint8_t)(soilSensorOut[1]);                       //  temp C shallow
-  appData[appDataSize++] = (uint8_t)(soilSensorOut[2]);                       //  pH shallow *10
-  appData[appDataSize++] = (uint8_t)(soilSensorOut[3]);                       //  moist deep
-  appData[appDataSize++] = (uint8_t)(soilSensorOut[4]);                       //  temp C deep
-  appData[appDataSize++] = (uint8_t)(soilSensorOut[5]);                       //  pH deep * 10
-  appData[appDataSize++] = (uint8_t)((RTC_SLOW_MEMORY[ULP_BAT_PCT] & 0xff));  //  battery pct
-#endif
+  if (g_device_role == ROLE_SOIL) {
+    appData[appDataSize++] = (uint8_t)(soilSensorOut[0]);                       //  moist shallow
+    appData[appDataSize++] = (uint8_t)(soilSensorOut[1]);                       //  temp C shallow
+    appData[appDataSize++] = (uint8_t)(soilSensorOut[2]);                       //  pH shallow *10
+    appData[appDataSize++] = (uint8_t)(soilSensorOut[3]);                       //  moist deep
+    appData[appDataSize++] = (uint8_t)(soilSensorOut[4]);                       //  temp C deep
+    appData[appDataSize++] = (uint8_t)(soilSensorOut[5]);                       //  pH deep * 10
+    appData[appDataSize++] = (uint8_t)((RTC_SLOW_MEMORY[ULP_BAT_PCT] & 0xff));  //  battery pct
+  }
 
-#ifdef LAKE_NODE
-  appData[appDataSize++] = (uint8_t)(wPres[0]);                               //  msb * 100
-  appData[appDataSize++] = (uint8_t)(wPres[1]);                               //  lsb
-  appData[appDataSize++] = (uint8_t)((RTC_SLOW_MEMORY[ULP_BAT_PCT] & 0xff));  //  battery pct
-#endif
+  if (g_device_role == ROLE_LAKE) {
+    appData[appDataSize++] = (uint8_t)(wPres[0]);                               //  msb * 100
+    appData[appDataSize++] = (uint8_t)(wPres[1]);                               //  lsb
+    appData[appDataSize++] = (uint8_t)((RTC_SLOW_MEMORY[ULP_BAT_PCT] & 0xff));  //  battery pct
+  }
 
   // for(int i = 0; i < 16; i++){
   //   Serial.printf(" [%2d]: 0x%08X\n", i, RTC_SLOW_MEMORY[i]);
@@ -975,6 +986,90 @@ static void rs485_spin() {
     delay(1000);
   }
 }
+static bool load_cfg_into_rtc_on_coldboot() {
+
+  if (!prefs.begin(NS, /*readOnly=*/true)) {  // NS == "cfg"
+    Serial.println("[CFG] prefs.begin failed");
+    return false;
+  }
+
+  // ---- schema / identity ----
+  g_schema_ver = prefs.getUChar(K_SCHEMA, 0);
+  g_device_role = prefs.getUChar(K_ROLE, 0);
+  g_uplink_fport = prefs.getUChar(K_FPORT, 0);
+  g_lake_type = prefs.getUChar(K_LAKE_TYP, 0);
+
+  if (g_schema_ver == 0) {
+    g_schema_ver = CFG_SCHEMA_VERSION;
+    Serial.printf("[CFG] schema_ver missing (using default %u, not stored)\n",
+                  (unsigned)g_schema_ver);
+  }
+  // ---- existing config you already use ----
+  g_lake_depth_mm = prefs.getUShort(K_LAKE_MM, g_lake_depth_mm);
+
+  uint16_t th = prefs.getUShort(K_WAKE_TH, PULSE_THRESHOLD);
+  RTC_SLOW_MEMORY[ULP_WAKE_THRESHOLD] = th;
+
+  char tmp[13] = {};
+  prefs.getString(K_NAME, tmp, sizeof(tmp));
+  if (tmp[0]) {
+    strncpy(g_name, tmp, sizeof(g_name) - 1);
+    g_name[sizeof(g_name) - 1] = '\0';
+  }
+
+  inv_m_u32 = prefs.getUInt(K_INV_M, inv_m_u32);
+  b_x10 = prefs.getInt(K_BX10, b_x10);
+
+  // ---- valve behavior (now kept in cfg) ----
+  //if (!prefs.isKey(K_V0_ACT)) prefs.putUShort(K_V0_ACT, g_v0_act_ms);
+  //if (!prefs.isKey(K_V1_ACT)) prefs.putUShort(K_V1_ACT, g_v1_act_ms);
+  g_v0_act_ms = prefs.getUShort(K_V0_ACT, g_v0_act_ms);
+  g_v1_act_ms = prefs.getUShort(K_V1_ACT, g_v1_act_ms);
+
+  //if (!prefs.isKey(K_V0_FWD)) prefs.putBool(K_V0_FWD, g_v0_open_fwd);
+  //if (!prefs.isKey(K_V1_FWD)) prefs.putBool(K_V1_FWD, g_v1_open_fwd);
+  g_v0_open_fwd = prefs.getBool(K_V0_FWD, g_v0_open_fwd);
+  g_v1_open_fwd = prefs.getBool(K_V1_FWD, g_v1_open_fwd);
+
+  prefs.end();
+
+  // ---- sanity / clamps (keep your existing clamp style) ----
+  g_v0_act_ms = (g_v0_act_ms < 50) ? 50 : (g_v0_act_ms > 1000) ? 1000
+                                                               : g_v0_act_ms;
+  g_v1_act_ms = (g_v1_act_ms < 50) ? 50 : (g_v1_act_ms > 1000) ? 1000
+                                                               : g_v1_act_ms;
+  if (!inv_m_u32) inv_m_u32 = 1;
+
+  // ---- mandatory provisioning check ----
+  if (g_device_role == 0 || g_uplink_fport == 0) {
+    Serial.printf("[CFG] INVALID: role=%u fport=%u (node not provisioned?)\n",
+                  (unsigned)g_device_role, (unsigned)g_uplink_fport);
+    return false;
+  }
+
+  // fPort becomes your application port
+  appPort = g_uplink_fport;
+
+  // ---- one-line boot summary ----
+  Serial.printf("[CFG] schema=%u role=%u fport=%u lake_type=%u name='%s'\n",
+                (unsigned)g_schema_ver,
+                (unsigned)g_device_role,
+                (unsigned)g_uplink_fport,
+                (unsigned)g_lake_type,
+                g_name);
+
+  Serial.printf("[CFG] lake_depth_mm=%u  wake_th=%u  inv_m=%u  b_x10=%d\n",
+                (unsigned)g_lake_depth_mm,
+                (unsigned)RTC_SLOW_MEMORY[ULP_WAKE_THRESHOLD],
+                (unsigned)inv_m_u32,
+                (int)b_x10);
+
+  Serial.printf("[CFG] valve: v0=%u ms (%s)  v1=%u ms (%s)\n",
+                (unsigned)g_v0_act_ms, g_v0_open_fwd ? "FWD" : "REV",
+                (unsigned)g_v1_act_ms, g_v1_open_fwd ? "FWD" : "REV");
+
+  return true;
+}
 
 void setup() {
 
@@ -1005,7 +1100,7 @@ void setup() {
     }
 
     // simple bus recovery if SDA stuck low
-    pinMode(PIN_SDA, INPUT_PULLUP);   // <-- add this line (re-claim SDA as GPIO)
+    pinMode(PIN_SDA, INPUT_PULLUP);  // <-- add this line (re-claim SDA as GPIO)
     pinMode(PIN_SCL, OUTPUT);
     for (int i = 0; i < 9 && digitalRead(PIN_SDA) == LOW; ++i) {
       digitalWrite(PIN_SCL, LOW);
@@ -1065,6 +1160,13 @@ void setup() {
     case ESP_SLEEP_WAKEUP_UNDEFINED:
       {  // THIS IS COLD RESTART
         Serial.printf("WAKEUP_BY_RESTART:::\n");
+        memset(RTC_SLOW_MEM, 0, CONFIG_ULP_COPROC_RESERVE_MEM);
+
+        // Load cfg once into RTC, and set appPort from cfg/uplink_fport
+        if (!load_cfg_into_rtc_on_coldboot()) {
+          Serial.println("[CFG] load failed - halting");
+          while (true) delay(1000);
+        }
         // --- Try loading LoRaWAN identity from NVS ---
         bool nvs_ok = load_lorawan_identity_from_nvs();
 
@@ -1081,76 +1183,30 @@ void setup() {
         valveState->onA = 0;
         valveState->onB = 0;
 
-        memset(RTC_SLOW_MEM, 0, CONFIG_ULP_COPROC_RESERVE_MEM);
-
-        // prefs restores + self-heal defaults (single open)
-        if (prefs.begin(NS, /*readOnly=*/false)) {
-
-          g_lake_depth_mm = prefs.getUShort(K_LAKE_MM, g_lake_depth_mm);
-
-          uint16_t th = prefs.getUShort(K_WAKE_TH, PULSE_THRESHOLD);
-          RTC_SLOW_MEMORY[ULP_WAKE_THRESHOLD] = th;
-
-          char tmp[13] = {};
-          prefs.getString(K_NAME, tmp, sizeof(tmp));
-          if (tmp[0]) {
-            strncpy(g_name, tmp, sizeof(g_name) - 1);
-            g_name[sizeof(g_name) - 1] = '\0';
-          }
-
-          inv_m_u32 = prefs.getUInt(K_INV_M, inv_m_u32);
-          b_x10 = prefs.getInt(K_BX10, b_x10);
-
-          if (!prefs.isKey("v0_act_ms")) prefs.putUShort("v0_act_ms", g_v0_act_ms);
-          if (!prefs.isKey("v1_act_ms")) prefs.putUShort("v1_act_ms", g_v1_act_ms);
-
-          g_v0_act_ms = prefs.getUShort("v0_act_ms", g_v0_act_ms);
-          g_v1_act_ms = prefs.getUShort("v1_act_ms", g_v1_act_ms);
-
-          prefs.end();
-        }
-
-        // clamp to sane limits
-        g_v0_act_ms = (g_v0_act_ms < 50) ? 50 : (g_v0_act_ms > 1000) ? 1000
-                                                                     : g_v0_act_ms;
-        g_v1_act_ms = (g_v1_act_ms < 50) ? 50 : (g_v1_act_ms > 1000) ? 1000
-                                                                     : g_v1_act_ms;
-
-        if (!inv_m_u32) inv_m_u32 = 1;
-
-        Serial.printf("Valve activation loaded: v0=%u ms  v1=%u ms\n",
-                      (unsigned)g_v0_act_ms, (unsigned)g_v1_act_ms);
-
-        Serial.printf("lake-depth init: %u (%.3f m)\n", g_lake_depth_mm, g_lake_depth_mm / 1000.0f);
-        Serial.printf("ULP_WAKE_THRESHOLD loaded: %u\n", (unsigned)RTC_SLOW_MEMORY[ULP_WAKE_THRESHOLD]);
-        Serial.printf("Calib restored: inv_m=%u cnt/m  b=%.1f m\n",
-                      (unsigned)inv_m_u32, b_x10 / 10.0f);
-
         size_t sz = sizeof(ulp_program) / sizeof(ulp_insn_t);
         esp_err_t r = ulp_process_macros_and_load(ULP_PROG_START, ulp_program, &sz);
         Serial.printf("load - %s, %u instructions\n", esp_err_to_name(r), (unsigned)sz);
         ESP_ERROR_CHECK(ulp_run(ULP_PROG_START));
-
-#if defined(VALVE_NODE)
-        if (g_coldboot_valve_init_done == 0) {
-          for (int t = 0; t < 1; t++) {
-            delay(500);
-            Serial.printf("set valves to on (cycle %d)...\n", t + 1);
-            controlValve(0, 1);
-            delay(500);
-            controlValve(1, 1);
-            delay(500);
-            Serial.printf("set valves to off (cycle %d/2)...\n", t + 1);
-            controlValve(0, 0);
-            delay(500);
-            controlValve(1, 0);
+        if (g_device_role == ROLE_VALVE) {
+          if (g_coldboot_valve_init_done == 0) {
+            for (int t = 0; t < 1; t++) {
+              delay(500);
+              Serial.printf("set valves to on (cycle %d)...\n", t + 1);
+              controlValve(0, 1);
+              delay(500);
+              controlValve(1, 1);
+              delay(500);
+              Serial.printf("set valves to off (cycle %d/2)...\n", t + 1);
+              controlValve(0, 0);
+              delay(500);
+              controlValve(1, 0);
+            }
+            delay(3000);
+            g_coldboot_valve_init_done = 1;
+          } else {
+            Serial.println("valve init skipped (already done this power-up)");
           }
-          delay(3000);
-          g_coldboot_valve_init_done = 1;
-        } else {
-          Serial.println("valve init skipped (already done this power-up)");
         }
-#endif
       }
       break;
 
@@ -1200,13 +1256,13 @@ void setup() {
 //############################################################################
 #endif
 
-#if defined(VALVE_NODE)
-  tick_timers(valveState);
-  uint32_t t_end = millis() + 200;
-  while ((int32_t)(millis() - t_end) < 0) {
-    vTaskDelay(pdMS_TO_TICKS(10));
+  if (g_device_role == ROLE_VALVE) {
+    tick_timers(valveState);
+    uint32_t t_end = millis() + 200;
+    while ((int32_t)(millis() - t_end) < 0) {
+      vTaskDelay(pdMS_TO_TICKS(10));
+    }
   }
-#endif
   pop_data();  //  populates the data fields from the sensors and calculations
   display_status();
   vTaskDelay(pdMS_TO_TICKS(3000));  //  let SPI settle
