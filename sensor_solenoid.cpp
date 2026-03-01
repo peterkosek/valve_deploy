@@ -24,7 +24,7 @@ extern uint32_t appTxDutyCycle;
 extern uint32_t txDutyCycleTime;
 extern uint16_t g_v0_act_ms;
 extern uint16_t g_v1_act_ms;
-extern bool g_v0_open_fwd;   // default for legacy nodes
+extern bool g_v0_open_fwd;  // default for legacy nodes
 extern bool g_v1_open_fwd;  // default for legacy nodes
 // Modbus master instance
 
@@ -64,6 +64,7 @@ void hardware_pins_init(void) {
   pinMode(PIN_SDA, INPUT_PULLUP);
   pinMode(PIN_SCL, INPUT_PULLUP);
   pinMode(VBAT_READ_PIN, INPUT);                      // not needed
+  
   analogSetPinAttenuation(VBAT_READ_PIN, ADC_2_5db);  //  6db reduces voltage to 1/2 of input
 
   pinMode(EPD_BUSY_PIN, INPUT);  //  status of the  epaper
@@ -143,9 +144,12 @@ uint8_t bat_cap8() {
   Serial.print("in bat_cap8()\n");
 
   digitalWrite(ADC_CTL_PIN, HIGH);
+  //Serial.printf("[BAT] pin=%u state=%d\n", VBAT_READ_PIN, (int)deviceState);
+  Serial.printf("[BAT] pin=%u state=%d\n", (unsigned)VBAT_READ_PIN, (int)deviceState);
   delay(40);
   uint16_t raw = analogRead(VBAT_READ_PIN);
   digitalWrite(ADC_CTL_PIN, LOW);
+  Serial.printf("[BAT] raw=%u\n", raw);
 
   // Clamp raw ADC into calibrated range
   if (raw <= ADC_RAW_3V1) {
@@ -160,8 +164,7 @@ uint8_t bat_cap8() {
 
   // Linear map: [ADC_RAW_3V1 .. ADC_RAW_4V1] → [0 .. 100]
   uint16_t pct =
-      (uint16_t)(((uint32_t)(raw - ADC_RAW_3V1) * 100U) /
-                 (uint32_t)(ADC_RAW_4V1 - ADC_RAW_3V1));
+    (uint16_t)(((uint32_t)(raw - ADC_RAW_3V1) * 100U) / (uint32_t)(ADC_RAW_4V1 - ADC_RAW_3V1));
 
   if (pct > 100) pct = 100;
 

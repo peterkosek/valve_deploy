@@ -44,6 +44,10 @@
   ((volatile type *)(RTC_SLOW_BYTE_MEM + (idx) * sizeof(uint32_t)))
 
 //  for prefs namespace access and UI semaphore
+static const char *NS_LORAWAN = "lorawan";
+static const char *K_DEVEUI = "devEui";  // 8 bytes
+static const char *K_APPKEY = "appKey";  // 16 bytes
+static const char *K_PROV = "provisioned";
 constexpr const char *NS = "cfg";
 constexpr const char *K_LAKE_MM = "lake_depth_mm";
 constexpr const char *K_WAKE_TH = "wake_th";
@@ -97,11 +101,13 @@ static bool i2c_ready = 0;
 static bool join_inflight = false;
 static uint32_t join_retry_at_ms = 0;
 
+RTC_DATA_ATTR volatile ValveCmd_t g_cmd;
 bool g_skip_next_decrement = false;
 // for display
 volatile bool g_need_display = false;
+volatile bool g_need_vlv_update = false;
 volatile uint32_t g_awake_until_ms = 0;  // keep CPU on until this time
-
+RTC_DATA_ATTR volatile ValveCmd_t g_pending_cmd = { 0, 0, 0 };
 
 // [GPT] helper: wait for E-Ink BUSY to go idle without blocking the whole system
 struct BoardIdentity {
@@ -114,9 +120,9 @@ struct BoardIdentity {
 char buffer[64];
 
 /* OTAA para*/
-uint8_t devEui[] = { 0x70, 0xB3, 0xD5, 0x7E, 0xD0, 0x06, 0x53, 0xff };
+RTC_DATA_ATTR uint8_t devEui[] = { 0x70, 0xB3, 0xD5, 0x7E, 0xD0, 0x06, 0x53, 0xff };
 uint8_t appEui[] = { 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 };
-uint8_t appKey[] = { 0x74, 0xD6, 0x6E, 0x63, 0x45, 0x82, 0x48, 0x27, 0xFE, 0xC5, 0xB7, 0x70, 0xBA, 0x2B, 0x50, 0x55 };
+RTC_DATA_ATTR uint8_t appKey[] = { 0x74, 0xD6, 0x6E, 0x63, 0x45, 0x82, 0x48, 0x27, 0xFE, 0xC5, 0xB7, 0x70, 0xBA, 0x2B, 0x50, 0x55 };
 
 /* ABP para --  not used for this project*/
 uint8_t nwkSKey[] = { 0x15, 0xb1, 0xd0, 0xef, 0xa4, 0x63, 0xdf, 0xbe, 0x3d, 0x11, 0x18, 0x1e, 0x1e, 0xc7, 0xda, 0x85 };
@@ -160,11 +166,14 @@ RTC_DATA_ATTR uint8_t g_device_role = 0;
 RTC_DATA_ATTR uint8_t g_uplink_fport = 0;
 RTC_DATA_ATTR uint8_t g_lake_type = 0;
 RTC_DATA_ATTR uint8_t g_schema_ver = 0;
-uint8_t appPort = 0;  // set on cold boot from cfg/uplink_fport
-
+RTC_DATA_ATTR uint8_t appPort = 0;  // set on cold boot from cfg/uplink_fport
+volatile bool g_need_delayed_send = false;
+uint32_t g_pending_send_at_ms = 0;
+uint32_t g_hold_awake_until_ms = 0;
+// --- delayed re-uplink after valve actuation ---
+volatile bool g_send_after_settle = false;
+volatile uint32_t g_send_due_ms = 0;
 uint16_t pressResult = 0;
-
-RTC_DATA_ATTR volatile ValveCmd_t g_cmd;
 
 //These are in RTC defined in lorawanapp.cpp
 extern int revrssi;
@@ -189,17 +198,31 @@ uint8_t confirmedNbTrials = 4;
 // apply_downlink_snapshot(&g_cmd, &valveState);
 // tick_timers(&valveState);              // your existing decrement/auto-off
 static BoardIdentity boardId;
+
+void schedule_delayed_send(uint32_t delay_ms) {
+  g_send_after_settle = true;
+  g_send_due_ms = millis() + delay_ms;
+}
+
 bool valve_open_fwd[2] = { true, true };  // defaults = safe
 
-
 bool eink_wait_idle(uint32_t timeout_ms) {
+  // Make sure pin is actually configured
+  pinMode(EPD_BUSY_PIN, INPUT);
 
-  const bool BUSY_ACTIVE = HIGH;  // DEPG0290 panels pull BUSY high while refreshing
-  uint32_t deadline = millis() + timeout_ms;
-  while (digitalRead(EPD_BUSY_PIN) == BUSY_ACTIVE) {
-    vTaskDelay(pdMS_TO_TICKS(500));  // yield to other tasks (LoRa, etc.)
+  const uint32_t start = millis();
 
-    if ((int32_t)(millis() - deadline) >= 0) return false;  // timed out
+  // Determine BUSY polarity at runtime:
+  // After a refresh starts, BUSY should be "busy" for a while.
+  // We treat "busy" as the *current* level at entry, then wait for it to change.
+  const int busy_level = digitalRead(EPD_BUSY_PIN);
+
+  while (digitalRead(EPD_BUSY_PIN) == busy_level) {
+    vTaskDelay(pdMS_TO_TICKS(25));  // small yield; doesn't hog timing
+
+    if ((uint32_t)(millis() - start) >= timeout_ms) {
+      return false;  // timed out
+    }
   }
   return true;
 }
@@ -304,7 +327,6 @@ inline uint16_t depth_m_from_raw(int16_t raw) {
   return static_cast<uint16_t>(depth100);
 }
 
-
 // scheduler with three cases, fast, valve on and normal
 // Pick base cycle time:
 //  - on cold boot, FAST_BURST_COUNT cycles at TX_CYCLE_FAST_TIME while no valves are timed
@@ -329,6 +351,25 @@ static inline uint32_t choose_cycle_base_ms(void) {
   return appTxDutyCycle;
 }
 
+static void take_downlink_snapshot(void) {
+  noInterrupts();
+
+  g_pending_cmd.flags = g_cmd.flags;
+  g_pending_cmd.unitsA = g_cmd.unitsA;
+  g_pending_cmd.unitsB = g_cmd.unitsB;
+
+  g_cmd.flags = 0;
+  g_cmd.unitsA = 0;
+  g_cmd.unitsB = 0;
+
+  interrupts();
+
+  Serial.printf("[DL] queued valve cmd: flags=0x%02X uA=%u uB=%u\n",
+                (unsigned)g_pending_cmd.flags,
+                (unsigned)g_pending_cmd.unitsA,
+                (unsigned)g_pending_cmd.unitsB);
+}
+
 // Simple scheduler: pick base period, add random dither, program LoRaWAN
 static inline void schedule_next_cycle(void) {
   const uint32_t base_ms = choose_cycle_base_ms();
@@ -348,6 +389,7 @@ static inline void schedule_next_cycle(void) {
 
 void display_status() {
   Serial.println("in display_status fx ");
+  pop_data();
   // [GPT] init-once in setup; removed display.init() here to avoid heap churn
 
   display.clear();  // wipe framebuffer before drawing
@@ -436,7 +478,7 @@ void display_status() {
   // [GPT] wait for E-Ink to finish via BUSY pin (non-blocking yield with timeout)
   bool ok = eink_wait_idle(4000);
   if (!ok) Serial.println("E-ink wait timeout; proceeding cautiously");
-  delay(2000);  //  more time to be sure...
+  delay(3000);  //  more time to be sure...
 
 }  // of function
 /*
@@ -595,7 +637,7 @@ void downLinkDataHandle(McpsIndication_t *mcpsIndication) {
     Serial.println("[DL] MAC-only (no FRMPayload) — handler exit");
     return;
   }
-
+  g_awake_until_ms = millis() + 8000;                // now stay awake to process this
   static uint32_t last_dl = 0xFFFFFFFF;              // guard: ignore same DL twice
   if (mcpsIndication->DownLinkCounter == last_dl) {  // Semtech stack provides this
     Serial.println("[DL] duplicate counter — ignored");
@@ -654,24 +696,11 @@ void downLinkDataHandle(McpsIndication_t *mcpsIndication) {
         cmd.unitsA = buf[0];  // <— A ticks
         cmd.unitsB = buf[1];  // <— B ticks
 
-        post_cmd(&cmd);             // drop into mailbox (see Fix 2)
-        apply_downlink_snapshot();  // atomically read+clear & act
-        Serial.printf("VALVE AFTER DL6: onA=%u timeA=%u onB=%u timeB=%u latchA=%u latchB=%u\n",
-                      (unsigned)valveState->onA,
-                      (unsigned)valveState->timeA,
-                      (unsigned)valveState->onB,
-                      (unsigned)valveState->timeB,
-                      (unsigned)valveState->latchA,
-                      (unsigned)valveState->latchB);
-        vTaskDelay(pdMS_TO_TICKS(WAIT_AFTER_VALVE_CHANGE));  //  no Rx window open, let the cpu free
-        pop_data();
-        //  new data after valve state change and delay, will pop_data as part of SEND
-        display_status();                 //  display it
-        vTaskDelay(pdMS_TO_TICKS(3000));  //  give SPI bus a chance
-        deviceState = DEVICE_STATE_SEND;  //  send it
-
-        xSemaphoreGive(g_uiSem);
-
+        post_cmd(&cmd);            // drop into mailbox (see Fix 2)
+        take_downlink_snapshot();  // atomically read+clear & act
+        g_need_vlv_update = true;
+        //xSemaphoreGive(g_uiSem);
+        g_awake_until_ms = millis() + 8000;  // stay awake 8s for debug/response
         break;
       }
 
@@ -1011,10 +1040,12 @@ static bool load_cfg_into_rtc_on_coldboot() {
   RTC_SLOW_MEMORY[ULP_WAKE_THRESHOLD] = th;
 
   char tmp[13] = {};
-  prefs.getString(K_NAME, tmp, sizeof(tmp));
-  if (tmp[0]) {
-    strncpy(g_name, tmp, sizeof(g_name) - 1);
-    g_name[sizeof(g_name) - 1] = '\0';
+  if (prefs.isKey(K_NAME)) {
+    prefs.getString(K_NAME, tmp, sizeof(tmp));
+    if (tmp[0]) {
+      strncpy(g_name, tmp, sizeof(g_name) - 1);
+      g_name[sizeof(g_name) - 1] = '\0';
+    }
   }
 
   inv_m_u32 = prefs.getUInt(K_INV_M, inv_m_u32);
@@ -1049,6 +1080,41 @@ static bool load_cfg_into_rtc_on_coldboot() {
 
   // fPort becomes your application port
   appPort = g_uplink_fport;
+
+  // ---- LoRaWAN OTAA identity lives in NVS namespace "lorawan" ----
+  if (!prefs.begin(NS_LORAWAN, /*readOnly=*/true)) {
+    Serial.println("[LORAWAN] prefs.begin failed");
+    return false;
+  }
+
+  // Optional: honor your provisioning marker
+  if (!prefs.getBool(K_PROV, false)) {
+    Serial.println("[LORAWAN] not provisioned");
+    prefs.end();
+    return false;
+  }
+
+  size_t n = 0;
+
+  n = prefs.getBytes(K_DEVEUI, devEui, 8);
+  if (n != 8) {
+    Serial.printf("[LORAWAN] missing/short devEui (got %u bytes)\n", (unsigned)n);
+    prefs.end();
+    return false;
+  }
+
+  n = prefs.getBytes(K_APPKEY, appKey, 16);
+  if (n != 16) {
+    Serial.printf("[LORAWAN] missing/short appKey (got %u bytes)\n", (unsigned)n);
+    prefs.end();
+    return false;
+  }
+
+  prefs.end();
+
+  Serial.printf("[LORAWAN] DevEui loaded: %02X:%02X:%02X:%02X:%02X:%02X:%02X:%02X\n",
+                devEui[0], devEui[1], devEui[2], devEui[3],
+                devEui[4], devEui[5], devEui[6], devEui[7]);
 
   // ---- one-line boot summary ----
   Serial.printf("[CFG] schema=%u role=%u fport=%u lake_type=%u name='%s'\n",
@@ -1115,14 +1181,6 @@ void setup() {
   i2c_ready = found;
   Serial.printf("I2C 0x68 %s\n", i2c_ready ? "OK" : "NACK");
   TxDutyCycle_hold = (TxDutyCycle_hold == 0) ? 3600000 : TxDutyCycle_hold;
-
-  static bool displayInited = false;
-  if (!displayInited) {
-    display.init();
-    displayInited = true;
-  }
-  display.screenRotate(ANGLE_180_DEGREE);
-  display.setFont(ArialMT_Plain_24);
 
   // configure RTC GPIO, enable ULP wake up.
   ESP_ERROR_CHECK(rtc_gpio_hold_dis(RTC_GPIO_SENSOR_PIN));
@@ -1263,19 +1321,23 @@ void setup() {
       vTaskDelay(pdMS_TO_TICKS(10));
     }
   }
-  pop_data();  //  populates the data fields from the sensors and calculations
-  display_status();
-  vTaskDelay(pdMS_TO_TICKS(3000));  //  let SPI settle
-
   Mcu.begin(HELTEC_BOARD, SLOW_CLK_TPYE);
-  //Serial.printf("wake up case completed, LORAWAN_APP_DATA_MAX_SIZE = %u\n", (unsigned)LORAWAN_APP_DATA_MAX_SIZE);
   vTaskDelay(pdMS_TO_TICKS(100));
+  static bool displayInited = false;
+  if (!displayInited) {
+    display.init();
+    displayInited = true;
 
-  //Serial.println("BOOT: after HELTEC_B start, Serial ready");
-  if (!adc.begin(ADC_ADDR, &Wire)) {
-    Serial.println("MCP3421 not found on Wire");
-  } else Serial.println("MCP3421 found");
-};  // of setup function
+    display.screenRotate(ANGLE_180_DEGREE);
+    display.setFont(ArialMT_Plain_24);
+    vTaskDelay(pdMS_TO_TICKS(50));  // short settle; NOT seconds
+    display_status();
+    //Serial.println("BOOT: after HELTEC_B start, Serial ready");
+    if (!adc.begin(ADC_ADDR, &Wire)) {
+      Serial.println("MCP3421 not found on Wire");
+    } else Serial.println("MCP3421 found");
+  }
+}  // of setup function
 
 
 void loop() {
@@ -1295,7 +1357,7 @@ void loop() {
     case DEVICE_STATE_JOIN:
       {
         // STOCK: let the MAC handle RX windows
-        //Serial.println("In JOIN");
+        Serial.println("[SM] ENTER JOIN -> calling LoRaWAN.join()");
         join_inflight = true;  // [CHANGE] flag OTAA in progress
         LoRaWAN.join();
         break;
@@ -1305,10 +1367,7 @@ void loop() {
         //  Join succeeded → clear inflight so UI can run again safely
         join_inflight = false;
         //Serial.println("In SEND");
-        pop_data();                       //  new data after valve state change and delay
-        vTaskDelay(pdMS_TO_TICKS(1000));  //   let pop_data be fully done...
-        // STOCK: build payload, send, then advance to CYCLE
-        prepareTxFrame(appPort);
+        prepareTxFrame(appPort);  //  has a pop_data() calll in it
         LoRaWAN.send();
         g_last_tx_ms = millis();
         deviceState = DEVICE_STATE_CYCLE;
@@ -1323,15 +1382,38 @@ void loop() {
       }
     case DEVICE_STATE_SLEEP:
       {
-        // Only draw if a token is available AND RX1/RX2 guard has elapsed
-        if ((xSemaphoreTake(g_uiSem, 0) == pdTRUE) && (rx_windows_clear()) && (join_inflight == false)) {
-          display_status();  // one-shot; no loops here
+        if (join_inflight) {
+          LoRaWAN.sleep(loraWanClass);    // <-- DO NOT skip this during join
+          vTaskDelay(pdMS_TO_TICKS(10));  // yield, keep pumping loop
+          break;
         }
-        // Before calling LoRaWAN.sleep(...) or when handling DEVICE_STATE_SLEEP:
-        // if (still_awake()) {
-        //   // skip sleeping for now; let loop() spin and the display stay lit
-        //   return;  // or fall through to other non-sleep housekeeping
-        // }
+        // Apply valve cmd as soon as safe, then start a 30 s settle window.
+        // if (g_need_vlv_update && rx_windows_clear() && !join_inflight) {
+        if (g_need_vlv_update) {
+          Serial.println("[VL] applying queued valve cmd (from SLEEP)");
+          apply_downlink_snapshot();  // actuate valve NOW
+          g_send_after_settle = true;
+          g_send_due_ms = millis() + 30000;  // <-- THIS is the missing piece
+          break;                             // optional but recommended: don't do UI work this loop
+        }
+
+        // Optional UI update (doesn't affect LoRaWAN timing)
+        if ((xSemaphoreTake(g_uiSem, 0) == pdTRUE) && rx_windows_clear() && !join_inflight) {
+          display_status();
+        }
+
+        // If we’re waiting to re-uplink, stay awake until due, then SEND exactly once.
+        if (g_send_after_settle) {
+          if ((int32_t)(millis() - g_send_due_ms) >= 0) {
+            g_send_after_settle = false;
+            deviceState = DEVICE_STATE_SEND;
+            break;
+          }
+          vTaskDelay(pdMS_TO_TICKS(50));  // don’t spin and don’t re-read sensors
+          break;
+        }
+
+        // Normal behavior when there's no valve event pending
         LoRaWAN.sleep(loraWanClass);
         break;
       }

@@ -29,28 +29,33 @@ enum { startTimedA = 1 << 0,
        offB = 1 << 5 };
 
 // Atomically read+clear from the mailbox, then act
+
 void apply_downlink_snapshot(void) {
   uint8_t f, uA, uB;
 
   noInterrupts();
-  f = g_cmd.flags;
-  uA = g_cmd.unitsA;
-  uB = g_cmd.unitsB;
-  g_cmd.flags = 0;
-  g_cmd.unitsA = 0;
-  g_cmd.unitsB = 0;
+  f = g_pending_cmd.flags;
+  uA = g_pending_cmd.unitsA;
+  uB = g_pending_cmd.unitsB;
+  g_pending_cmd.flags = 0;
+  g_pending_cmd.unitsA = 0;
+  g_pending_cmd.unitsB = 0;
   interrupts();
 
+  Serial.printf("[DL] applied valve cmd: flags=0x%02X uA=%u uB=%u\n",
+                f,
+                uA,
+                uB);
   // --- HARD OFF overrides ---
 
-  if (f & offA) {
+  if (f & FLAG_OFF_A) {
     controlValve(0, 0);
     valveState->onA = 0;
     valveState->latchA = 0;
     valveState->timeA = 0;
   }
 
-  if (f & offB) {
+  if (f & FLAG_OFF_B) {
     controlValve(1, 0);
     valveState->onB = 0;
     valveState->latchB = 0;
@@ -59,15 +64,15 @@ void apply_downlink_snapshot(void) {
 
   // --- LATCH (force ON, no timer) ---
 
-  if (f & LATCH_A) {
+  if (f & FLAG_LATCH_A) {
     Serial.printf("A latch ON\n");
     controlValve(0, 1);
-    valveState->onA = 0;  // "on" is for timed, latch is separate
+    valveState->onA = 0;
     valveState->latchA = 1;
     valveState->timeA = 0;
   }
 
-  if (f & LATCH_B) {
+  if (f & FLAG_LATCH_B) {
     Serial.printf("B latch ON\n");
     controlValve(1, 1);
     valveState->onB = 0;
@@ -77,27 +82,23 @@ void apply_downlink_snapshot(void) {
 
   // --- TIMED (turn ON, clear latch, set ticks from units) ---
 
-  if (f & START_TIMED_A) {
+  if (f & FLAG_ON_A) {
     controlValve(0, 1);
     valveState->onA = 1;
     valveState->latchA = 0;
-    valveState->timeA = uA;  // 10-minute units from your downlink
+    valveState->timeA = uA;
   }
 
-  if (f & START_TIMED_B) {
+  if (f & FLAG_ON_B) {
     controlValve(1, 1);
     valveState->onB = 1;
     valveState->latchB = 0;
     valveState->timeB = uB;
   }
-
-  // NOTE:
-  // We do NOT call LoRaWAN.cycle() here anymore.
-  // The main loop's DEVICE_STATE_SEND -> DEVICE_STATE_CYCLE path
-  // will schedule the next wake using valveState->timeA/timeB.
+  g_awake_until_ms = millis() + 35000;
+  g_need_vlv_update = false;  //  wait 30 seconds and send an uplink before sleep
 }
 
-#include "valve_logic.h"
 
 void show_vlv_status(uint8_t vlv) {
   switch (vlv) {
@@ -139,24 +140,20 @@ void tick_timers(volatile ValveState_t* v) {
   if (v->onA && !v->latchA && v->timeA == 0) {
     controlValve(0, 0);
     v->onA = 0;
-
-    // Optional: trigger an immediate status uplink so server sees OFF quickly
+    g_send_after_settle = true;
+    g_send_due_ms = millis() + 30000;
 
     xSemaphoreGive(g_uiSem);
-    vTaskDelay(pdMS_TO_TICKS(3000));
-    deviceState = DEVICE_STATE_SEND;
   }
 
   // timed B expired -> turn OFF
   if (v->onB && !v->latchB && v->timeB == 0) {
     controlValve(1, 0);
     v->onB = 0;
+    g_send_after_settle = true;
+    g_send_due_ms = millis() + 30000;
 
-    // Optional: immediate status uplink
     xSemaphoreGive(g_uiSem);
-    pop_data();
-    vTaskDelay(pdMS_TO_TICKS(3000));
-    deviceState = DEVICE_STATE_SEND;
   }
 
   g_skip_next_decrement = true;  // only once per wake cycle
