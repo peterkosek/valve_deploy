@@ -19,7 +19,7 @@ extern volatile bool g_need_vlv_update;
 extern volatile bool g_send_after_settle;
 extern volatile uint32_t g_send_due_ms;
 void schedule_delayed_send(uint32_t);
-
+void request_work_after_settle_30s(void);
 void post_cmd(const volatile ValveCmd_t*);
 void apply_downlink_snapshot(void);
 void show_vlv_status(uint8_t vlv);

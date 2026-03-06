@@ -34,6 +34,9 @@
 #include <string.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
+#include "freertos/task.h"
+#include "freertos/timers.h"
+#include <atomic>
 
 
 // 2) A handy macro to get a pointer to any struct at a given word-index:
@@ -79,6 +82,37 @@ constexpr uint8_t ROLE_SOIL = 6;
 
 //  semaphjore for the screen
 SemaphoreHandle_t g_uiSem;
+
+// =====================
+// 2) WorkTask event bits
+// =====================
+static const uint32_t EVT_WORK_START = (1u << 0);      // run UI+send pipeline
+static const uint32_t EVT_SETTLE_EXPIRED = (1u << 1);  // 30 s delay done
+static const uint32_t EVT_BUSY_EXPIRED = (1u << 2);    // 6 s guard done
+static const uint32_t EVT_UI_REQUEST = (1u << 3);      // request UI update
+// =====================
+// 3) Timers + task handle
+// =====================
+static TaskHandle_t g_work_task = nullptr;
+static TimerHandle_t g_settle_timer = nullptr;  // 30 s timer
+static TimerHandle_t g_busy_timer = nullptr;    // 6 s guard timer
+static volatile bool g_deferred_settle_start = false;
+
+// =====================
+// 4) Work pipeline state
+// =====================
+enum WorkPhase : uint8_t {
+  WORK_IDLE = 0,
+  WORK_DO_UI,
+  WORK_WAIT_UI_GUARD,
+  WORK_DO_SEND,
+  WORK_WAIT_SEND_GUARD,
+};
+
+static std::atomic<bool> g_work_pending{ false };
+static portMUX_TYPE g_work_mux = portMUX_INITIALIZER_UNLOCKED;
+static volatile bool g_work_busy = false;  // WorkTask is mid-pipeline
+static volatile WorkPhase g_work_phase = WORK_IDLE;
 
 volatile ValveState_t *valveState = RTC_SLOW_STRUCT_PTR(ValveState_t, ULP_VALVE_A);
 
@@ -199,6 +233,160 @@ uint8_t confirmedNbTrials = 4;
 // tick_timers(&valveState);              // your existing decrement/auto-off
 static BoardIdentity boardId;
 
+void request_work_after_settle_30s(void) {
+  g_work_pending = true;
+
+  if (!g_settle_timer) {
+    Serial.println("[WARN] settle timer not created yet; deferring start");
+    g_deferred_settle_start = true;
+    return;
+  }
+
+  xTimerStop(g_settle_timer, 0);
+  xTimerChangePeriod(g_settle_timer, pdMS_TO_TICKS(30000), 0);
+  xTimerStart(g_settle_timer, 0);
+  Serial.println("[WORK] 30s settle timer (re)started");
+}
+
+// =====================
+// 5) Timer callbacks (ISR-safe: they run in timer task context)
+// =====================
+static void settle_timer_cb(TimerHandle_t) {
+  if (g_work_task) xTaskNotify(g_work_task, EVT_SETTLE_EXPIRED, eSetBits);
+}
+
+static void busy_timer_cb(TimerHandle_t) {
+  if (g_work_task) xTaskNotify(g_work_task, EVT_BUSY_EXPIRED, eSetBits);
+}
+
+// =====================
+// 6) Helpers to arm timers
+// =====================
+void start_settle_timer_30s(void) {
+  if (!g_settle_timer) return;
+  xTimerStop(g_settle_timer, 0);
+  xTimerChangePeriod(g_settle_timer, pdMS_TO_TICKS(30000), 0);
+  xTimerStart(g_settle_timer, 0);
+}
+
+static inline void start_guard_timer_ms(uint32_t ms) {
+  if (!g_busy_timer) return;
+  xTimerStop(g_busy_timer, 0);
+  xTimerChangePeriod(g_busy_timer, pdMS_TO_TICKS(ms), 0);
+  xTimerStart(g_busy_timer, 0);
+}
+// work_task.cpp (or wherever your work_task currently lives)
+//
+
+static void work_task(void *) {
+  for (;;) {
+    uint32_t bits = 0;
+    xTaskNotifyWait(0, 0xFFFFFFFFu, &bits, portMAX_DELAY);
+
+    if (bits & EVT_SETTLE_EXPIRED) {
+      // Only send if we actually armed a "send after settle"
+      if (g_send_after_settle) {
+        g_send_after_settle = false;  // consume: exactly one
+        g_work_pending = true;        // now due -> run SEND pipeline
+
+        if (!g_work_busy) {
+          g_work_busy = true;
+          g_work_phase = WORK_DO_SEND;
+        }
+      }
+    }
+    if (bits & EVT_UI_REQUEST) {
+      if (!g_work_busy) {
+        g_work_busy = true;
+        g_work_phase = WORK_DO_UI;
+      }
+    }
+
+    // We treat "busyExpired" as: did we get the timer notification this wake?
+    bool busyExpired = bits & EVT_BUSY_EXPIRED;
+
+    // ---- Phase machine (single-owner, sequential) ----
+    while (g_work_busy) {
+      switch (g_work_phase) {
+
+        case WORK_DO_SEND:
+          {
+            // Make sure e-paper is de-selected during send + RX windows
+            //pinMode(Eink_CS, OUTPUT);
+            //digitalWrite(Eink_CS, HIGH);
+            Serial.println("about to SEND");
+            prepareTxFrame(appPort);  // builds payload (may call pop_data inside your version)
+            g_last_tx_ms = millis();
+            Serial.printf("[TX] sent @%lu ms -> RX guard start\n", (unsigned long)g_last_tx_ms);
+            LoRaWAN.send();
+
+            start_guard_timer_ms(6000);
+            g_work_phase = WORK_WAIT_SEND_GUARD;
+            goto wait_more;
+          }
+
+        case WORK_WAIT_SEND_GUARD:
+          {
+            if (!busyExpired) goto wait_more;
+            busyExpired = false;  // <-- consume it
+            // Now it's safe to touch display/SPI
+            g_work_phase = WORK_DO_UI;
+            continue;
+          }
+
+        case WORK_DO_UI:
+          {
+            // You said: display only on startup + re-transmission
+            // This is the retransmission path.
+            // pop_data();
+            display_status();
+
+            start_guard_timer_ms(3500);
+            g_work_phase = WORK_WAIT_UI_GUARD;
+            goto wait_more;
+          }
+
+        case WORK_WAIT_UI_GUARD:
+          {
+            if (!busyExpired) goto wait_more;
+            busyExpired = false;  // consume it
+
+            // Done with UI guard
+            g_work_phase = WORK_IDLE;
+            g_work_busy = false;
+
+            // Atomically test+clear pending
+            bool do_send = false;
+            portENTER_CRITICAL(&g_work_mux);
+            do_send = g_work_pending;
+            g_work_pending = false;
+            portEXIT_CRITICAL(&g_work_mux);
+
+            if (do_send) {
+              g_work_busy = true;
+              g_work_phase = WORK_DO_SEND;
+              break;
+            }
+
+            deviceState = DEVICE_STATE_CYCLE;
+            break;
+          }
+
+        default:
+          {
+            g_work_phase = WORK_IDLE;
+            g_work_busy = false;
+            g_work_pending = false;
+            deviceState = DEVICE_STATE_CYCLE;
+            break;
+          }
+      }
+    }
+
+wait_more:;  // nothing
+  }
+}
+
 void schedule_delayed_send(uint32_t delay_ms) {
   g_send_after_settle = true;
   g_send_due_ms = millis() + delay_ms;
@@ -207,26 +395,9 @@ void schedule_delayed_send(uint32_t delay_ms) {
 bool valve_open_fwd[2] = { true, true };  // defaults = safe
 
 bool eink_wait_idle(uint32_t timeout_ms) {
-  // Make sure pin is actually configured
-  pinMode(EPD_BUSY_PIN, INPUT);
-
-  const uint32_t start = millis();
-
-  // Determine BUSY polarity at runtime:
-  // After a refresh starts, BUSY should be "busy" for a while.
-  // We treat "busy" as the *current* level at entry, then wait for it to change.
-  const int busy_level = digitalRead(EPD_BUSY_PIN);
-
-  while (digitalRead(EPD_BUSY_PIN) == busy_level) {
-    vTaskDelay(pdMS_TO_TICKS(25));  // small yield; doesn't hog timing
-
-    if ((uint32_t)(millis() - start) >= timeout_ms) {
-      return false;  // timed out
-    }
-  }
+  vTaskDelay(pdMS_TO_TICKS(timeout_ms));
   return true;
 }
-
 
 const char *deviceStateToString(eDeviceState_LoraWan s) {
   switch (s) {
@@ -383,13 +554,14 @@ static inline void schedule_next_cycle(void) {
   Serial.print(txDutyCycleTime);
   Serial.println(" cycle time set...");
 
-
+  Serial.printf("[CYCLE] calling LoRaWAN.cycle(%lu)\n", (unsigned long)txDutyCycleTime);
   LoRaWAN.cycle(txDutyCycleTime);
+  Serial.println("[CYCLE] returned from LoRaWAN.cycle()");
 }
 
 void display_status() {
   Serial.println("in display_status fx ");
-  pop_data();
+
   // [GPT] init-once in setup; removed display.init() here to avoid heap churn
 
   display.clear();  // wipe framebuffer before drawing
@@ -476,9 +648,6 @@ void display_status() {
   // }
 
   // [GPT] wait for E-Ink to finish via BUSY pin (non-blocking yield with timeout)
-  bool ok = eink_wait_idle(4000);
-  if (!ok) Serial.println("E-ink wait timeout; proceeding cautiously");
-  delay(3000);  //  more time to be sure...
 
 }  // of function
 /*
@@ -633,6 +802,22 @@ static void prepareTxFrame(uint8_t port) {
 
 
 void downLinkDataHandle(McpsIndication_t *mcpsIndication) {
+  Serial.printf("[DL-RAW] RxData=%u Port=%u Len=%u Cnt=%lu RxSlot=%u RSSI=%d SNR=%d\n",
+                (unsigned)mcpsIndication->RxData,
+                (unsigned)mcpsIndication->Port,
+                (unsigned)mcpsIndication->BufferSize,
+                (unsigned long)mcpsIndication->DownLinkCounter,
+                (unsigned)mcpsIndication->RxSlot,
+                (int)mcpsIndication->Rssi,
+                (int)mcpsIndication->Snr);
+
+  if (mcpsIndication->RxData && mcpsIndication->Buffer && mcpsIndication->BufferSize) {
+    Serial.print("[DL-RAW] bytes:");
+    for (uint8_t i = 0; i < mcpsIndication->BufferSize; ++i) {
+      Serial.printf(" %02X", mcpsIndication->Buffer[i]);
+    }
+    Serial.println();
+  }
   if (!mcpsIndication || !mcpsIndication->RxData) {
     Serial.println("[DL] MAC-only (no FRMPayload) — handler exit");
     return;
@@ -649,10 +834,19 @@ void downLinkDataHandle(McpsIndication_t *mcpsIndication) {
   const uint8_t len = mcpsIndication->BufferSize;
   const uint8_t port = mcpsIndication->Port;
   const char *rxw = (mcpsIndication->RxSlot) ? "RXWIN2" : "RXWIN1";
-  Serial.printf("[DL] win=%s  port=%u  len=%u  cnt=%lu  rssi=%d  snr=%d\n",
-                rxw, (unsigned)port, (unsigned)len,
-                (unsigned long)mcpsIndication->DownLinkCounter,
-                (int)mcpsIndication->Rssi, (int)mcpsIndication->Snr);
+  const uint32_t now = millis();
+  const uint32_t dt = (g_last_tx_ms != 0) ? (now - g_last_tx_ms) : 0;
+  Serial.printf("[RX] slot=%u %s @+%lu ms  port=%u len=%u cnt=%lu\n",
+                (unsigned)mcpsIndication->RxSlot,
+                rxw,
+                (unsigned long)dt,
+                (unsigned)mcpsIndication->Port,
+                (unsigned)mcpsIndication->BufferSize,
+                (unsigned long)mcpsIndication->DownLinkCounter);
+  if (!mcpsIndication || !mcpsIndication->RxData) {
+    Serial.println("[DL] MAC-only (no FRMPayload) — handler exit");
+    return;
+  }
 
   Serial.printf("+++++REV DATA:%s,RXSIZE %u,PORT %u\r\n",
                 rxw, (unsigned)len, (unsigned)port);
@@ -677,10 +871,15 @@ void downLinkDataHandle(McpsIndication_t *mcpsIndication) {
         g_sched_override_ms = ms;
         deviceState = DEVICE_STATE_CYCLE;  // re-run scheduler once
 
-        display_status();                 //  display it
+        //display_status();                 //  display it
         vTaskDelay(pdMS_TO_TICKS(3000));  //  give SPI bus a chance
 
         Serial.printf("cycle req: %u min -> %lu ms\n", (unsigned)minutes, (unsigned long)ms);
+
+        if (g_work_task) {
+          xTaskNotify(g_work_task, EVT_UI_REQUEST, eSetBits);
+        }
+
         break;
       }
 
@@ -698,8 +897,15 @@ void downLinkDataHandle(McpsIndication_t *mcpsIndication) {
 
         post_cmd(&cmd);            // drop into mailbox (see Fix 2)
         take_downlink_snapshot();  // atomically read+clear & act
-        g_need_vlv_update = true;
+                                   // Apply immediately (don’t wait for SLEEP)
+        Serial.printf("[DL6] APPLY NOW flags=0x%02X uA=%u uB=%u\n",
+                      (unsigned)g_pending_cmd.flags,
+                      (unsigned)g_pending_cmd.unitsA,
+                      (unsigned)g_pending_cmd.unitsB);
+        apply_downlink_snapshot();  // must clear g_need_vlv_update inside (or clear it here)
+        //g_need_vlv_update = true;
         //xSemaphoreGive(g_uiSem);
+        request_work_after_settle_30s();     // only after a real valve command
         g_awake_until_ms = millis() + 8000;  // stay awake 8s for debug/response
         break;
       }
@@ -735,7 +941,10 @@ void downLinkDataHandle(McpsIndication_t *mcpsIndication) {
           prefs.end();
         }
         Serial.println("#####name is updated");
-
+        if (g_work_task) {
+          xTaskNotify(g_work_task, EVT_UI_REQUEST, eSetBits);
+        }
+        g_awake_until_ms = millis() + 8000;
         break;
       }
 
@@ -749,7 +958,10 @@ void downLinkDataHandle(McpsIndication_t *mcpsIndication) {
           prefs.end();
         }
         Serial.printf("#####NVS reed threshold write (value=%u)\n", (unsigned)th);
-
+        if (g_work_task) {
+          xTaskNotify(g_work_task, EVT_UI_REQUEST, eSetBits);
+        }
+        g_awake_until_ms = millis() + 8000;
         break;
       }
 
@@ -795,7 +1007,10 @@ void downLinkDataHandle(McpsIndication_t *mcpsIndication) {
         }
         Serial.printf("#####lake-depth set: %u (%.3f m) %s\n",
                       depth_mm, depth_mm / 1000.0f, ok ? "stored" : "NVS_FAIL");
-
+        if (g_work_task) {
+          xTaskNotify(g_work_task, EVT_UI_REQUEST, eSetBits);
+        }
+        g_awake_until_ms = millis() + 8000;
         break;
       }
 
@@ -847,10 +1062,10 @@ void downLinkDataHandle(McpsIndication_t *mcpsIndication) {
 
   }  // of switch
 
-  xSemaphoreGive(g_uiSem);
+
   revrssi = mcpsIndication->Rssi;
   revsnr = mcpsIndication->Snr;
-
+  //request_work_after_settle_30s();
   Serial.println("downlink processed");
 }  // of function
 
@@ -1142,6 +1357,18 @@ void setup() {
   Serial.begin(115200);
   delay(1000);
 
+  // ---- create timers ----
+  if (!g_settle_timer) g_settle_timer = xTimerCreate("settle30", pdMS_TO_TICKS(30000), pdFALSE, nullptr, settle_timer_cb);
+  if (!g_busy_timer) g_busy_timer = xTimerCreate("busy6", pdMS_TO_TICKS(6000), pdFALSE, nullptr, busy_timer_cb);
+  if (g_deferred_settle_start) {
+    g_deferred_settle_start = false;
+    request_work_after_settle_30s();
+  }
+  // ---- create WorkTask ----
+  if (!g_work_task) {
+    xTaskCreatePinnedToCore(work_task, "work", 4096, nullptr, 1, &g_work_task, 1);
+  }
+  
   Serial.println("Booting...");
 
   if (g_uiSem == NULL) {
@@ -1327,16 +1554,17 @@ void setup() {
   if (!displayInited) {
     display.init();
     displayInited = true;
-
     display.screenRotate(ANGLE_180_DEGREE);
     display.setFont(ArialMT_Plain_24);
-    vTaskDelay(pdMS_TO_TICKS(50));  // short settle; NOT seconds
-    display_status();
-    //Serial.println("BOOT: after HELTEC_B start, Serial ready");
-    if (!adc.begin(ADC_ADDR, &Wire)) {
-      Serial.println("MCP3421 not found on Wire");
-    } else Serial.println("MCP3421 found");
   }
+  //vTaskDelay(pdMS_TO_TICKS(50));  // short settle; NOT seconds
+  //display_status();
+
+  //Serial.println("BOOT: after HELTEC_B start, Serial ready");
+  if (!adc.begin(ADC_ADDR, &Wire)) {
+    Serial.println("MCP3421 not found on Wire");
+  } else Serial.println("MCP3421 found");
+
 }  // of setup function
 
 
@@ -1364,56 +1592,110 @@ void loop() {
       }
     case DEVICE_STATE_SEND:
       {
-        //  Join succeeded → clear inflight so UI can run again safely
+        // Join succeeded → clear inflight so UI can run again safely
         join_inflight = false;
-        //Serial.println("In SEND");
-        prepareTxFrame(appPort);  //  has a pop_data() calll in it
-        LoRaWAN.send();
-        g_last_tx_ms = millis();
-        deviceState = DEVICE_STATE_CYCLE;
+
+        // Kick the pipeline immediately (boot/normal send path)
+        // g_work_pending = true;
+        if (!g_work_busy && g_work_task) {
+          g_work_busy = true;
+          g_work_phase = WORK_DO_SEND;
+          xTaskNotify(g_work_task, EVT_WORK_START, eSetBits);
+        }
+
+        // DO NOT do send here; WorkTask will set deviceState = DEVICE_STATE_CYCLE when done.
+        deviceState = DEVICE_STATE_SLEEP;
         break;
       }
     case DEVICE_STATE_CYCLE:
       {
-        //Serial.println("In CYCLE");
-        schedule_next_cycle();  //  LoRaWAN.cycle() that allows for fast initial cycles to figure our ADR and make settings
+        Serial.println("[CYCLE] enter");
+        schedule_next_cycle();
+        Serial.println("[CYCLE] after schedule_next_cycle (about to set SLEEP)");
         deviceState = DEVICE_STATE_SLEEP;
         break;
       }
     case DEVICE_STATE_SLEEP:
       {
-        if (join_inflight) {
-          LoRaWAN.sleep(loraWanClass);    // <-- DO NOT skip this during join
-          vTaskDelay(pdMS_TO_TICKS(10));  // yield, keep pumping loop
+        // // ---- DEBUG SNAPSHOT (entering SLEEP) ----
+        // {
+        //   esp_sleep_wakeup_cause_t wake = esp_sleep_get_wakeup_cause();
+
+        //   const bool settle_active =
+        //     (g_settle_timer && xTimerIsTimerActive(g_settle_timer) != pdFALSE);
+
+        //   const bool busy_active =
+        //     (g_busy_timer && xTimerIsTimerActive(g_busy_timer) != pdFALSE);
+
+        //   Serial.printf(
+        //     "[SLEEP-ENTRY] wake=%d  need_vlv=%d  work_pending=%d  work_busy=%d  "
+        //     "settle_active=%d  busy_active=%d\n",
+        //     (int)wake,
+        //     (int)g_need_vlv_update,
+        //     (int)g_work_pending,
+        //     (int)g_work_busy,
+        //     (int)settle_active,
+        //     (int)busy_active);
+        // }
+        // -----------------------------------------
+        // 1) Pump LoRa stack (timers + radio IRQs) WITHOUT sleeping the MCU.
+        // Equivalent of LoRaWAN.sleep() minus Mcu.sleep().
+        Mcu.timerhandler();
+        Radio.IrqProcess();
+
+        // *** CRITICAL GUARD ***
+        // If pumping caused the LoRaWAN callbacks to advance the state (e.g. JOINED -> SEND),
+        // do NOT continue in SLEEP and do NOT deep-sleep. Let loop() run the new state.
+        if (deviceState != DEVICE_STATE_SLEEP) {
           break;
         }
-        // Apply valve cmd as soon as safe, then start a 30 s settle window.
-        // if (g_need_vlv_update && rx_windows_clear() && !join_inflight) {
-        if (g_need_vlv_update) {
-          Serial.println("[VL] applying queued valve cmd (from SLEEP)");
-          apply_downlink_snapshot();  // actuate valve NOW
-          g_send_after_settle = true;
-          g_send_due_ms = millis() + 30000;  // <-- THIS is the missing piece
-          break;                             // optional but recommended: don't do UI work this loop
-        }
 
-        // Optional UI update (doesn't affect LoRaWAN timing)
-        if ((xSemaphoreTake(g_uiSem, 0) == pdTRUE) && rx_windows_clear() && !join_inflight) {
-          display_status();
-        }
-
-        // If we’re waiting to re-uplink, stay awake until due, then SEND exactly once.
-        if (g_send_after_settle) {
-          if ((int32_t)(millis() - g_send_due_ms) >= 0) {
-            g_send_after_settle = false;
-            deviceState = DEVICE_STATE_SEND;
+        // --- RX WINDOW FAST-PUMP GUARD ---
+        // For ~3.5 s after any TX, do NOTHING except pump the LoRa stack.
+        if (g_last_tx_ms != 0) {
+          const uint32_t RX_GUARD_MS = 3500;
+          if ((int32_t)(millis() - (g_last_tx_ms + RX_GUARD_MS)) < 0) {
+            vTaskDelay(pdMS_TO_TICKS(2));
             break;
           }
-          vTaskDelay(pdMS_TO_TICKS(50));  // don’t spin and don’t re-read sensors
+          g_last_tx_ms = 0;  // guard window finished
+        }
+
+        // 2) During join, don't do anything else. Just keep pumping.
+        if (join_inflight) {
+          vTaskDelay(pdMS_TO_TICKS(10));
           break;
         }
 
-        // Normal behavior when there's no valve event pending
+        // 3) If a downlink queued a valve update, apply it now.
+        // if (g_need_vlv_update) {
+        //   Serial.println("[VL] applying queued valve cmd (from SLEEP)");
+        //   apply_downlink_snapshot();        // must clear g_need_vlv_update inside
+        //   request_work_after_settle_30s();  // owe exactly one uplink after settle
+        // }
+
+        // 4) If we have any pending/active work timers, stay awake and keep pumping.
+        const bool settle_active =
+          (g_settle_timer && xTimerIsTimerActive(g_settle_timer) != pdFALSE);
+
+        const bool busy_active =
+          (g_busy_timer && xTimerIsTimerActive(g_busy_timer) != pdFALSE);
+
+        // If valve update is pending OR settle countdown running OR pipeline running OR busy guard running
+        // If valve update is pending OR settle countdown running OR pipeline running OR busy guard running
+        if (g_need_vlv_update || g_work_busy || g_send_after_settle || settle_active || busy_active) {
+          vTaskDelay(pdMS_TO_TICKS(20));
+          break;
+        }
+        // *** LATE GUARD ***
+        // deviceState can change after the first guard (e.g. WorkTask -> CYCLE/SEND).
+        // If it did, do NOT deep-sleep here.
+        if (deviceState != DEVICE_STATE_SLEEP) {
+          break;
+        }
+        // 5) Nothing to do -> NOW we are allowed to really sleep.
+
+        // Serial.printf("about to sleep with .sleep STATE -> %s\n", deviceStateToString(deviceState));
         LoRaWAN.sleep(loraWanClass);
         break;
       }

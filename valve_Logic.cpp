@@ -95,6 +95,7 @@ void apply_downlink_snapshot(void) {
     valveState->latchB = 0;
     valveState->timeB = uB;
   }
+
   g_awake_until_ms = millis() + 35000;
   g_need_vlv_update = false;  //  wait 30 seconds and send an uplink before sleep
 }
@@ -140,20 +141,14 @@ void tick_timers(volatile ValveState_t* v) {
   if (v->onA && !v->latchA && v->timeA == 0) {
     controlValve(0, 0);
     v->onA = 0;
-    g_send_after_settle = true;
-    g_send_due_ms = millis() + 30000;
-
-    xSemaphoreGive(g_uiSem);
+    request_work_after_settle_30s();
   }
 
   // timed B expired -> turn OFF
   if (v->onB && !v->latchB && v->timeB == 0) {
     controlValve(1, 0);
     v->onB = 0;
-    g_send_after_settle = true;
-    g_send_due_ms = millis() + 30000;
-
-    xSemaphoreGive(g_uiSem);
+    request_work_after_settle_30s();
   }
 
   g_skip_next_decrement = true;  // only once per wake cycle
