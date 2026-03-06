@@ -868,6 +868,7 @@ void downLinkDataHandle(McpsIndication_t *mcpsIndication) {
         uint32_t ms = minutes * 60000u;
 
         appTxDutyCycle = ms;
+        TxDutyCycle_hold = ms;        //  in case this change occured when a valve was open so that the new value is used.  
         g_sched_override_ms = ms;
         deviceState = DEVICE_STATE_CYCLE;  // re-run scheduler once
 
