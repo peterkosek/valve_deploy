@@ -1,6 +1,7 @@
 #include "projdefs.h"
 #include "esp32-hal-adc.h"
 #include "sensor_solenoid.h"
+#include "globals.h"
 #include "esp32s3/ulp.h"  //  this also includes ulp_common.h
 #include <HardwareSerial.h>
 #include <stdbool.h>
@@ -19,7 +20,6 @@ static const uint32_t BAUDRATE = 9600;
 static const uint16_t REG_START = 0x0000;  // holding register start
 static const uint16_t REG_COUNT = 1;       // read one 16-bit register
 
-extern uint32_t TxDutyCycle_hold;
 extern uint32_t appTxDutyCycle;
 extern uint32_t txDutyCycleTime;
 extern uint16_t g_v0_act_ms;
@@ -63,8 +63,8 @@ void hardware_pins_init(void) {
   pinMode(ADC_CTL_PIN, OUTPUT);
   pinMode(PIN_SDA, INPUT_PULLUP);
   pinMode(PIN_SCL, INPUT_PULLUP);
-  pinMode(VBAT_READ_PIN, INPUT);                      // not needed
-  
+  pinMode(VBAT_READ_PIN, INPUT);  // not needed
+
   analogSetPinAttenuation(VBAT_READ_PIN, ADC_2_5db);  //  6db reduces voltage to 1/2 of input
 
   pinMode(EPD_BUSY_PIN, INPUT);  //  status of the  epaper
@@ -452,74 +452,228 @@ static bool waitBusIdle(uint32_t baud, uint32_t timeout_ms = 100) {
   return false;  // bus stayed busy
 }
 
-// ---- Read depth sensor via raw Modbus RTU (manual DE) ---------------------------
-// Sends: 01 03 00 04 00 01 C5 CB
-// Expects: 01 03 02 HI LO CRC_L CRC_H
-// Returns: (HI<<8)|LO on success, 0xFFFF on failure after retries.
-uint16_t readDepthSensor(unsigned long timeout_ms = 400, uint8_t max_tries = 7) {
+inline uint16_t lake_depth_mm_from_raw(int32_t raw) {
+  if (inv_m_u32 == 0) return 0;  // guard
+  // wide, signed math; avoid overflow on *100
+  int64_t num = static_cast<int64_t>(raw);
+  int64_t scale = static_cast<int64_t>(inv_m_u32);
+  int64_t bx10 = static_cast<int64_t>(b_x10);
+
+  // depth_m = raw / inv_m_u32 + b_x10/10
+  // return (depth_m * 100)/100 as uint16_t with clamp 0..65535
+  int64_t depth = ((num)*100) / scale + (bx10 * 10);  // (b_x10/10)*100 = b_x10*10
+  if (depth < 0) depth = 0;
+  if (depth > 65535) depth = 65535;
+  return static_cast<uint16_t>((depth) / 100);  //  this is to return to correct units for calc
+}
+// ---- Depth sensor dispatcher + shared Modbus RTU transport ----------------------
+// Returns depth in mm on success, 0xFFFF on failure after retries.
+//
+// g_lake_type meanings:
+//   1 = 16-bit lake sensor: reply uses bytes [3],[4], uncalibrated
+//   2 = 32-bit sensor: reply uses bytes [3],[4],[5],[6], subtract 1,000,000,000,
+//       then calibrate with lake_depth_mm_from_raw(...)
+//   3 = test sensor: request is different, surrogate depth is bytes [5],[6], uncalibrated
+
+enum : uint8_t {
+  LAKE_TYPE_16BIT = 1,
+  LAKE_TYPE_32BIT = 2,
+  LAKE_TYPE_TEST = 3,
+};
+
+struct DepthSensorProfile {
+  const uint8_t* req;
+  uint8_t req_len;
+  uint8_t expected_byte_count;  // Modbus byte-count field (rx[i+2])
+};
+
+static bool rs485_modbus_request(const uint8_t* req,
+                                 uint8_t req_len,
+                                 uint8_t* rx,
+                                 size_t rx_cap,
+                                 size_t& n,
+                                 unsigned long timeout_ms) {
   static bool inited = false;
   if (!inited) {
-    // UART1 on pins RX=44, TX=43. Start with 9600 8N1.
-    Serial1.begin(9600, SERIAL_8N1, 44, 43);
+    Serial1.begin(9600, SERIAL_8N1, 44, 43);  // RX=44, TX=43
     pinMode(RS485_DE, OUTPUT);
-    digitalWrite(RS485_DE, LOW);  // receive by default
+    digitalWrite(RS485_DE, LOW);              // receive by default
     inited = true;
   }
 
-  //const uint8_t req[8] = { 0x01, 0x03, 0x00, 0x04, 0x00, 0x01, 0xC5, 0xCB };
-  const uint8_t req[8] = { 0x01, 0x03, 0x00, 0x04, 0x00, 0x01, 0xc5, 0xcb };  //  for the second 2 metor sensor
+  // purge RX
+  while (Serial1.available()) (void)Serial1.read();
+
+  // --- transmit with DE high ---
+  digitalWrite(RS485_DE, HIGH);
+
+  Serial.printf("[RS485] TX %u bytes :", (unsigned)req_len);
+  for (uint8_t k = 0; k < req_len; ++k) {
+    Serial.printf(" %02X", req[k]);
+  }
+  Serial.println();
+
+  size_t sent = Serial1.write(req, req_len);
+  Serial1.flush();
+  delayMicroseconds(200);  // ~2 char times @ 9600
+  digitalWrite(RS485_DE, LOW);
+
+  if (sent != req_len) {
+    n = 0;
+    // Serial.printf("[RS485] short write: sent=%u expected=%u\n",
+    //               (unsigned)sent, (unsigned)req_len);
+    return false;
+  }
+
+  // --- collect until idle gap ---
+  n = 0;
+  unsigned long t0 = millis(), last_rx = 0;
+  const unsigned idle_gap_ms = 5;
+  bool first_byte_logged = false;
+
+  while ((millis() - t0) < timeout_ms) {
+    while (Serial1.available()) {
+      if (!first_byte_logged) {
+        //Serial.printf("[RS485] first byte after %lu ms\n",
+                      //(unsigned long)(millis() - t0));
+        first_byte_logged = true;
+      }
+
+      if (n < rx_cap) rx[n++] = (uint8_t)Serial1.read();
+      last_rx = millis();
+    }
+
+    if (n && Serial1.available() == 0 && (millis() - last_rx) >= idle_gap_ms) {
+      break;
+    }
+  }
+
+  // Serial.printf("[RS485] RX done: n=%u timeout_ms=%lu\n",
+  //               (unsigned)n,
+  //               timeout_ms);
+
+  return (n > 0);
+}
+static int find_valid_modbus_frame_tail_first(const uint8_t* rx,
+                                              size_t n,
+                                              uint8_t expected_byte_count) {
+  // Frame shape:
+  //   01 03 BC ...data... CRC_L CRC_H
+  // Total frame length = 3 + BC + 2
+  const int frame_len = 3 + (int)expected_byte_count + 2;
+  if ((int)n < frame_len) return -1;
+
+  for (int i = (int)n - frame_len; i >= 0; --i) {
+    if (rx[i + 0] != 0x01) continue;
+    if (rx[i + 1] != 0x03) continue;
+    if (rx[i + 2] != expected_byte_count) continue;
+
+    const uint16_t crc_calc = modbusCRC(&rx[i], 3 + expected_byte_count);
+    const uint16_t crc_recv =
+      (uint16_t)rx[i + 3 + expected_byte_count] | ((uint16_t)rx[i + 4 + expected_byte_count] << 8);
+
+    if (crc_calc == crc_recv) {
+      return i;
+    }
+  }
+
+  return -1;
+}
+
+static const DepthSensorProfile* get_depth_sensor_profile(uint8_t lake_type) {
+  // Type 1: 16-bit lake sensor, one register at 0x0004
+  static const uint8_t req_16bit[8] = {
+    0x01, 0x03, 0x00, 0x04, 0x00, 0x01, 0xC5, 0xCB
+  };
+
+  // Type 2: 32-bit sensor, two registers at 0x0004
+  // If your known-good 32-bit request bytes differ, replace these 8 bytes.
+  static const uint8_t req_32bit[8] = {
+    0x01, 0x03, 0x00, 0x04, 0x00, 0x02, 0x84, 0x0A
+  };
+
+  // Type 3: test probe, two registers at 0x0001
+  static const uint8_t req_test[8] = {
+    0x01, 0x03, 0x00, 0x01, 0x00, 0x02, 0x95, 0xCB
+  };
+
+  static const DepthSensorProfile p16 = { req_16bit, 8, 0x02 };
+  static const DepthSensorProfile p32 = { req_32bit, 8, 0x04 };
+  static const DepthSensorProfile ptest = { req_test, 8, 0x04 };
+
+  switch (lake_type) {
+    case LAKE_TYPE_16BIT: return &p16;
+    case LAKE_TYPE_32BIT: return &p32;
+    case LAKE_TYPE_TEST: return &ptest;
+    default: return &p16;
+  }
+}
+
+uint16_t readDepthSensor(unsigned long timeout_ms = 400, uint8_t max_tries = 7) {
+  const DepthSensorProfile* profile = get_depth_sensor_profile(g_lake_type);
+  Serial.printf("[LAKE] g_lake_type=%u expected: 16=%u 32=%u test=%u\n",
+                (unsigned)g_lake_type,
+                (unsigned)LAKE_TYPE_16BIT,
+                (unsigned)LAKE_TYPE_32BIT,
+                (unsigned)LAKE_TYPE_TEST);
+  if (!profile) return 0xFFFF;
 
   for (uint8_t attempt = 1; attempt <= max_tries; ++attempt) {
-    // purge RX
-    while (Serial1.available()) (void)Serial1.read();
+    uint8_t rx[64];
+    size_t n = 0;
 
-    // --- transmit with DE high ---
-    digitalWrite(RS485_DE, HIGH);  // drive bus
-    size_t sent = Serial1.write(req, sizeof(req));
-    Serial1.flush();  // wait for TX FIFO to drain
-    // guard for last stop-bit to clear the line
-    delayMicroseconds(200);       // ~2 char times @ 9600
-    digitalWrite(RS485_DE, LOW);  // back to receive
-
-    if (sent != sizeof(req)) {
+    if (!rs485_modbus_request(profile->req, profile->req_len, rx, sizeof(rx), n, timeout_ms)) {
       delay(5);
       continue;
     }
 
-    // --- collect until idle gap ---
-    uint8_t rx[64];
-    size_t n = 0;
-    unsigned long t0 = millis(), last_rx = 0;
-    const unsigned idle_gap_ms = 5;
-
-    while ((millis() - t0) < timeout_ms) {
-      while (Serial1.available()) {
-        if (n < sizeof(rx)) rx[n++] = (uint8_t)Serial1.read();
-        last_rx = millis();
-      }
-      if (n && Serial1.available() == 0 && (millis() - last_rx) >= idle_gap_ms) break;
+    Serial.printf("[LAKE] attempt=%u rx bytes=%u :", (unsigned)attempt, (unsigned)n);
+    for (size_t k = 0; k < n; ++k) {
+      Serial.printf(" %02X", rx[k]);
     }
+    Serial.println();
 
-    if (n < 7) {
-      delay(15);
+    const int i = find_valid_modbus_frame_tail_first(rx, n, profile->expected_byte_count);
+    if (i < 0) {
+      Serial.printf("[LAKE] no valid frame, expected byte_count=%u\n",
+                    (unsigned)profile->expected_byte_count);
+      delay(20);
       continue;
     }
 
-    // search tail for the exact 7B frame 01 03 02 HI LO CRC_L CRC_H
-    for (int i = (int)n - 7; i >= 0; --i) {
-      if (rx[i] == 0x01 && rx[i + 1] == 0x03 && rx[i + 2] == 0x02) {
-        uint16_t crc_calc = modbusCRC(&rx[i], 5);
-        uint16_t crc_recv = (uint16_t)rx[i + 5] | ((uint16_t)rx[i + 6] << 8);
-        if (crc_calc == crc_recv) {
-          return ((uint16_t)rx[i + 3] << 8) | rx[i + 4];
-        }
-      }
+    // ---- Type 1: 16-bit lake sensor -> bytes [3],[4], uncalibrated ----
+    if (g_lake_type == LAKE_TYPE_16BIT) {
+      const uint16_t depth_mm = ((uint16_t)rx[i + 3] << 8) | rx[i + 4];
+      Serial.printf("[LAKE1] depth mm: %u\n", depth_mm);
+      return depth_mm;
+    }
+
+    // ---- Type 2: 32-bit sensor -> bytes [3],[4],[5],[6], calibrated ----
+    if (g_lake_type == LAKE_TYPE_32BIT) {
+      const uint32_t v =
+        ((uint32_t)rx[i + 3] << 24) | ((uint32_t)rx[i + 4] << 16) | ((uint32_t)rx[i + 5] << 8) | ((uint32_t)rx[i + 6] << 0);
+
+      Serial.printf("[LAKE2] raw 32-bit value: %lu\n", (unsigned long)v);
+
+      const int32_t lakeDepth32Raw = (v < 1000000000UL) ? 0 : (int32_t)(v - 1000000000UL);
+      const uint16_t depth_mm = lake_depth_mm_from_raw(lakeDepth32Raw);
+
+      Serial.printf("[LAKE2] adjusted raw: %ld\n", (long)lakeDepth32Raw);
+      Serial.printf("[LAKE2] depth mm: %u\n", depth_mm);
+      return depth_mm;
+    }
+
+    // ---- Type 3: test probe -> bytes [5],[6], uncalibrated surrogate ----
+    if (g_lake_type == LAKE_TYPE_TEST) {
+      const uint16_t depth_mm = ((uint16_t)rx[i + 5] << 8) | rx[i + 6];
+      Serial.printf("[LAKE3] surrogate depth mm: %u\n", depth_mm);
+      return depth_mm;
     }
 
     delay(20);
   }
-
-  return 0xFFFF;
+  Serial.printf("[LAKE] request failed, attempt unknown=\n");
+  return 0xEEEE;
 }
 
 /* read soil sensor by RS-485, check CRC and fill global array 

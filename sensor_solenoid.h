@@ -209,6 +209,8 @@ extern uint8_t wPres[2];         // raw pressure from adc, needs calibration and
 extern uint8_t reedCount[2];  // reed pulses counted, MSB, LSB
 extern uint8_t reedcyclesTenMin[2]; // intra reed pulse converted to frequency in activations in 10 min, MSB, LSB
 extern uint8_t soilSensorOut[6];  //  for the two soil sensors including moisture, temp and pH
+extern const char *K_INV_M;
+extern const char *K_BX10;
 
 // Function prototypes
 void hardware_pins_init();
@@ -233,6 +235,7 @@ static void dumpHex(const char* tag, const uint8_t* buf, size_t len);
 void rs485_uart_loopback_test(uint32_t baud);
 uint32_t addJitterClampMin(uint32_t base_ms, int32_t jitter_ms, uint32_t min_ms);
 void scheduleValveOnCycle(void);
+inline uint16_t lake_depth_mm_from_raw(int32_t raw) ;
 bool readModbusFrame_dbg(const char* file, int line,
 uint8_t addr, uint16_t startReg, uint16_t regCount,
 uint8_t* outBuf, size_t outMax,

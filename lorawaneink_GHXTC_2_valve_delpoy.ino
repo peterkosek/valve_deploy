@@ -15,6 +15,8 @@
 //#include "LoRaMacCommands.h"
 #include "Wire.h"
 #include "GXHTC.h"
+#include "globals.h"
+#include "prefs_helpers.h"
 #include "HT_DEPG0290BxS800FxX_BW.h"
 #include "sensor_solenoid.h"
 #include "esp_sleep.h"
@@ -45,193 +47,17 @@
 #define RTC_SLOW_MEMORY ((volatile uint32_t *)SOC_RTC_DATA_LOW)
 #define RTC_SLOW_STRUCT_PTR(type, idx) \
   ((volatile type *)(RTC_SLOW_BYTE_MEM + (idx) * sizeof(uint32_t)))
-
-//  for prefs namespace access and UI semaphore
-static const char *NS_LORAWAN = "lorawan";
-static const char *K_DEVEUI = "devEui";  // 8 bytes
-static const char *K_APPKEY = "appKey";  // 16 bytes
-static const char *K_PROV = "provisioned";
-constexpr const char *NS = "cfg";
-constexpr const char *K_LAKE_MM = "lake_depth_mm";
-constexpr const char *K_WAKE_TH = "wake_th";
-constexpr const char *K_NAME = "screenMsg";
-constexpr const char *K_INV_M = "inv_m_u32";
-constexpr const char *K_BX10 = "b_x10";
-constexpr const char *NVS_NS = "lorawan";  //  for nvs storage of devEui and appKey
-constexpr const char *K_SCHEMA = "schema_ver";
-constexpr const char *K_ROLE = "device_role";
-constexpr const char *K_FPORT = "uplink_fport";
-constexpr const char *K_LAKE_TYP = "lake_type";
-
-// Valve keys stored in cfg (per your decision B)
-constexpr const char *K_V0_ACT = "v0_act_ms";
-constexpr const char *K_V1_ACT = "v1_act_ms";
-constexpr const char *K_V0_FWD = "v0_open_fwd";
-constexpr const char *K_V1_FWD = "v1_open_fwd";
-
-// ---- schema control ----
-constexpr uint8_t CFG_SCHEMA_VERSION = 1;
-
-// ---- device roles (must match provisioning values) ----
-constexpr uint8_t ROLE_LAKE = 1;
-constexpr uint8_t ROLE_VALVE = 2;
-constexpr uint8_t ROLE_METER = 3;
-constexpr uint8_t ROLE_TEST = 4;
-constexpr uint8_t ROLE_SOIL_AIR = 5;
-constexpr uint8_t ROLE_SOIL = 6;
-
-//  semaphjore for the screen
-SemaphoreHandle_t g_uiSem;
-
-// =====================
-// 2) WorkTask event bits
-// =====================
-static const uint32_t EVT_WORK_START = (1u << 0);      // run UI+send pipeline
-static const uint32_t EVT_SETTLE_EXPIRED = (1u << 1);  // 30 s delay done
-static const uint32_t EVT_BUSY_EXPIRED = (1u << 2);    // 6 s guard done
-static const uint32_t EVT_UI_REQUEST = (1u << 3);      // request UI update
-// =====================
-// 3) Timers + task handle
-// =====================
-static TaskHandle_t g_work_task = nullptr;
-static TimerHandle_t g_settle_timer = nullptr;  // 30 s timer
-static TimerHandle_t g_busy_timer = nullptr;    // 6 s guard timer
-static volatile bool g_deferred_settle_start = false;
-
-// =====================
-// 4) Work pipeline state
-// =====================
-enum WorkPhase : uint8_t {
-  WORK_IDLE = 0,
-  WORK_DO_UI,
-  WORK_WAIT_UI_GUARD,
-  WORK_DO_SEND,
-  WORK_WAIT_SEND_GUARD,
-};
-
-static std::atomic<bool> g_work_pending{ false };
-static portMUX_TYPE g_work_mux = portMUX_INITIALIZER_UNLOCKED;
-static volatile bool g_work_busy = false;  // WorkTask is mid-pipeline
-static volatile WorkPhase g_work_phase = WORK_IDLE;
-
+#define FAST_BURST_COUNT 10
 volatile ValveState_t *valveState = RTC_SLOW_STRUCT_PTR(ValveState_t, ULP_VALVE_A);
-
-RTC_DATA_ATTR volatile uint32_t g_status_uplink_at = 0;
-static const uint32_t STATUS_UPLINK_DELAY_MS = 3000;  // ~3 s after RX2
-
-
-DEPG0290BxS800FxX_BW display(5, 4, 3, 6, 2, 1, -1, 6000000);  // rst,dc,cs,busy,sck,mosi,miso,frequency
-//GXHTC gxhtc;
-Preferences prefs;  // for NVM
-Adafruit_SHT4x sht4 = Adafruit_SHT4x();
-TwoWire *I2C = &Wire;
-Adafruit_MCP3421 adc;
-
-static uint32_t g_last_tx_ms = 0;
-static bool i2c_ok = true;
-static uint8_t i2c_fail_streak = 0;
-static uint32_t i2c_quiet_until_ms = 0;
-static bool i2c_ready = 0;
-static bool join_inflight = false;
-static uint32_t join_retry_at_ms = 0;
-
-RTC_DATA_ATTR volatile ValveCmd_t g_cmd;
-bool g_skip_next_decrement = false;
-// for display
-volatile bool g_need_display = false;
-volatile bool g_need_vlv_update = false;
-volatile uint32_t g_awake_until_ms = 0;  // keep CPU on until this time
-RTC_DATA_ATTR volatile ValveCmd_t g_pending_cmd = { 0, 0, 0 };
-
-// [GPT] helper: wait for E-Ink BUSY to go idle without blocking the whole system
-struct BoardIdentity {
-  bool provisioned;
-  bool valve_open_fwd[2];
-};
-
-
-
-char buffer[64];
-
-/* OTAA para*/
-RTC_DATA_ATTR uint8_t devEui[] = { 0x70, 0xB3, 0xD5, 0x7E, 0xD0, 0x06, 0x53, 0xff };
-uint8_t appEui[] = { 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 };
-RTC_DATA_ATTR uint8_t appKey[] = { 0x74, 0xD6, 0x6E, 0x63, 0x45, 0x82, 0x48, 0x27, 0xFE, 0xC5, 0xB7, 0x70, 0xBA, 0x2B, 0x50, 0x55 };
-
-/* ABP para --  not used for this project*/
-uint8_t nwkSKey[] = { 0x15, 0xb1, 0xd0, 0xef, 0xa4, 0x63, 0xdf, 0xbe, 0x3d, 0x11, 0x18, 0x1e, 0x1e, 0xc7, 0xda, 0x85 };
-uint8_t appSKey[] = { 0xd7, 0x2c, 0x78, 0x75, 0x8c, 0xdc, 0xca, 0xbf, 0x55, 0xee, 0x4a, 0x77, 0x8d, 0x16, 0xef, 0x67 };
-uint32_t devAddr = (uint32_t)0x007e6ae1;
-
-/*LoraWan channelsmask, default channels US915 band 2 hybrid*/
-uint16_t userChannelsMask[6] = { 0xff00, 0x0000, 0x0000, 0x0001, 0x0000, 0x0000 };
-
-/*LoraWan region, select in arduino IDE tools*/
-LoRaMacRegion_t loraWanRegion = ACTIVE_REGION;
-
-/*LoraWan Class, Class A and Class C are supported*/
-DeviceClass_t loraWanClass = CLASS_A;
-
-/*the application data transmission duty cycle.  value in [ms].*/
-#if defined(DEBUG_TIMING)
-RTC_DATA_ATTR uint32_t appTxDutyCycle = 60 * 60 * 1 * 1000;  //  60 second sleeps
-#define CYCLE_TIME_VALVE_ON 45000                            // debuf, go fast, should be 600000
-#else
-RTC_DATA_ATTR uint32_t appTxDutyCycle = 60 * 60 * 3 * 1000;  //min/hr * sec/min * hrs * min/ms
-#define CYCLE_TIME_VALVE_ON 600000  // 10 min in ms, cycle time with valve on, should be 600000
-#endif
-RTC_DATA_ATTR volatile uint32_t TxDutyCycle_hold = 3600000;  //  backup TxDutyCycleHold
-RTC_DATA_ATTR volatile int8_t initialCycleFast;              //  number of times to cycle fast on startup, initialized with FAST_BURST_COUNT on cold boot
-#define FAST_BURST_COUNT 10                                  // cycles to conclude with rapid time for ADR on cold boot
-RTC_DATA_ATTR volatile uint32_t g_sched_override_ms = 0;     //  pending cycle time changes to apply just before sleep
-
-static const uint32_t TX_CYCLE_FAST_TIME = 60000ul;  //  set the fast cycle time that has limited cycles
-
-RTC_DATA_ATTR uint32_t inv_m_u32 = 346;  //  valves: (1/m, b_x10):  1/8 in ch (extra sleve) 224, -103, no sleve (1/4 inch) 100, -130, or 128, -150...
-RTC_DATA_ATTR int32_t b_x10 = -117;
-RTC_DATA_ATTR uint32_t g_lake_depth_mm = 0;
-RTC_DATA_ATTR char g_name[12] = { 0 };
-RTC_DATA_ATTR uint32_t g_coldboot_valve_init_done = 0;
-RTC_DATA_ATTR uint16_t g_v0_act_ms = 200;
-RTC_DATA_ATTR uint16_t g_v1_act_ms = 200;
-RTC_DATA_ATTR bool g_v0_open_fwd = true;  // default for legacy nodes
-RTC_DATA_ATTR bool g_v1_open_fwd = true;  // default for legacy nodes
-RTC_DATA_ATTR uint8_t g_device_role = 0;
-RTC_DATA_ATTR uint8_t g_uplink_fport = 0;
-RTC_DATA_ATTR uint8_t g_lake_type = 0;
-RTC_DATA_ATTR uint8_t g_schema_ver = 0;
-RTC_DATA_ATTR uint8_t appPort = 0;  // set on cold boot from cfg/uplink_fport
-volatile bool g_need_delayed_send = false;
-uint32_t g_pending_send_at_ms = 0;
-uint32_t g_hold_awake_until_ms = 0;
-// --- delayed re-uplink after valve actuation ---
-volatile bool g_send_after_settle = false;
-volatile uint32_t g_send_due_ms = 0;
-uint16_t pressResult = 0;
-
+DEPG0290BxS800FxX_BW display(5, 4, 3, 6, 2, 1, -1, 6000000);
 //These are in RTC defined in lorawanapp.cpp
 extern int revrssi;
 extern int revsnr;
-
-/*OTAA or ABP*/
-bool overTheAirActivation = true;
-
-/*ADR enable*/
-bool loraWanAdr = true;
-
-/* Indicates if the node is sending confirmed or unconfirmed messages */
-bool isTxConfirmed = false;
-
-// * Note, that if NbTrials is set to 1 or 2, the MAC will not decrease
-// * the datarate, in case the LoRaMAC layer did not receive an acknowledgment
-// */
-uint8_t confirmedNbTrials = 4;
 
 // Main cycle order (sketch):
 // ValveCmd_t g_cmd; snapshot_cmd(&g_cmd);
 // apply_downlink_snapshot(&g_cmd, &valveState);
 // tick_timers(&valveState);              // your existing decrement/auto-off
-static BoardIdentity boardId;
 
 void request_work_after_settle_30s(void) {
   g_work_pending = true;
@@ -392,8 +218,6 @@ void schedule_delayed_send(uint32_t delay_ms) {
   g_send_due_ms = millis() + delay_ms;
 }
 
-bool valve_open_fwd[2] = { true, true };  // defaults = safe
-
 bool eink_wait_idle(uint32_t timeout_ms) {
   vTaskDelay(pdMS_TO_TICKS(timeout_ms));
   return true;
@@ -413,7 +237,7 @@ const char *deviceStateToString(eDeviceState_LoraWan s) {
 static bool load_lorawan_identity_from_nvs() {
   Preferences p;
 
-  if (!p.begin(NVS_NS, true)) {  // read-only
+  if (!p.begin(cfg::NS_LORAWAN)) {  // read-only
     Serial.println("[NVS] open FAILED");
     return false;
   }
@@ -627,14 +451,16 @@ void display_status() {
   }
 
   if (g_device_role == ROLE_LAKE) {
-    // --- Lake depth display (calibrated meters), uplink remains uncalibrated ---
-    // RTC carries last pressResult
-
-    uint16_t depth_m = depth_m_from_raw(pressResult);
-
+    display.setFont(ArialMT_Plain_16);
+    snprintf(buffer, sizeof(buffer), "sensor depth");
+    display.drawString(80, 60, buffer);
+    snprintf(buffer, sizeof(buffer), "%.3f m", static_cast<float>(g_lake_sensor_mm) * (1.0f / 1000.0f));
+    display.drawString(80, 80, buffer);
     display.setFont(ArialMT_Plain_24);
-    snprintf(buffer, sizeof(buffer), "Depth: %.3f", float(depth_m / 100));
-    display.drawString(120, 30, buffer);
+    snprintf(buffer, sizeof(buffer), "Depth: %.3f m", static_cast<float>(g_lake_depth_mm) * (1.0f / 1000.0f));
+    display.drawString(140, 26, buffer);
+    snprintf(buffer, sizeof(buffer), "Level: %.3f m", static_cast<float>(g_lake_level_mm) * (1.0f / 1000.0f));
+    display.drawString(140, 0, buffer);
   }
 
 
@@ -729,15 +555,24 @@ void pop_data(void) {
   }
 
   if (g_device_role == ROLE_LAKE) {
-    delay(100);  //  allow sensor to stabilize
-    uint16_t lakeResult = readDepthSensor(200, 7);
-    pressResult = depth_m_from_raw(lakeResult);
-    wPres[0] = (pressResult >> 8);
-    wPres[1] = (pressResult & 0xFF);
-  }
+    delay(100);  // allow sensor to stabilize
 
-  //xSemaphoreGive(g_uiSem);
+    g_lake_depth_mm = readDepthSensor(300, 3);
+
+    if (pressResult == LAKE_SENSOR_OFFLINE) {
+      Serial.println("[LAKE] sensor offline -> 0xEEEE");
+      return;
+    }
+
+    //wPres[0] = (pressResult >> 8);      //  for the data frame transmission
+    //wPres[1] = (pressResult & 0xFF);
+    g_lake_level_mm = (int16_t)g_lake_depth_mm - (int16_t)g_lake_sensor_mm ;
+       Serial.printf("g_lake_depth_mm %u \n", g_lake_depth_mm);
+          Serial.printf("g_lake_level_mm %d \n", g_lake_level_mm);
+             Serial.printf("g_lake_sensor_mm %u \n", g_lake_sensor_mm);
+  }
 }
+
 
 /* Prepares the payload of the frame and decrements valve counter or turns off if time is up*/
 static void prepareTxFrame(uint8_t port) {
@@ -855,27 +690,32 @@ void downLinkDataHandle(McpsIndication_t *mcpsIndication) {
   revsnr = mcpsIndication->Snr;
 
   switch (port) {
-    case 5:  //  change the cycle time
+    case 5:  // change the cycle time
       {
         if (len != 1 && len != 2) {
           Serial.println("cycle-time ignored (len!=1/2)");
           break;
         }
-        uint32_t minutes = (len == 1) ? (uint32_t)buf[0]
-                                      : (((uint32_t)buf[0] << 8) | (uint32_t)buf[1]);
+
+        uint32_t minutes = (len == 1)
+                             ? (uint32_t)buf[0]
+                             : (((uint32_t)buf[0] << 8) | (uint32_t)buf[1]);
+
         if (minutes < 10) minutes = 10;
         if (minutes > 1440) minutes = 1440;
+
         uint32_t ms = minutes * 60000u;
 
         appTxDutyCycle = ms;
-        TxDutyCycle_hold = ms;        //  in case this change occured when a valve was open so that the new value is used.  
+        TxDutyCycle_hold = ms;  // in case this change occurred while a valve was open
         g_sched_override_ms = ms;
-        deviceState = DEVICE_STATE_CYCLE;  // re-run scheduler once
+        deviceState = DEVICE_STATE_CYCLE;
 
-        //display_status();                 //  display it
-        vTaskDelay(pdMS_TO_TICKS(3000));  //  give SPI bus a chance
+        vTaskDelay(pdMS_TO_TICKS(3000));  // give SPI bus a chance
 
-        Serial.printf("cycle req: %u min -> %lu ms\n", (unsigned)minutes, (unsigned long)ms);
+        Serial.printf("cycle req: %u min -> %lu ms\n",
+                      (unsigned)minutes,
+                      (unsigned long)ms);
 
         if (g_work_task) {
           xTaskNotify(g_work_task, EVT_UI_REQUEST, eSetBits);
@@ -884,30 +724,30 @@ void downLinkDataHandle(McpsIndication_t *mcpsIndication) {
         break;
       }
 
-    case 6:  //  set the valve status
-      {      // ValveCmd_t downlink = [flags, unitsA, unitsB]
+    case 6:  // set the valve status
+      {
         if (len != 3) {
           Serial.printf("[DL6] bad length: %u (want 3)\n", (unsigned)len);
           break;
         }
 
         ValveCmd_t cmd{};
-        cmd.flags = buf[2];   // <— flags last
-        cmd.unitsA = buf[0];  // <— A ticks
-        cmd.unitsB = buf[1];  // <— B ticks
+        cmd.flags = buf[2];
+        cmd.unitsA = buf[0];
+        cmd.unitsB = buf[1];
 
-        post_cmd(&cmd);            // drop into mailbox (see Fix 2)
-        take_downlink_snapshot();  // atomically read+clear & act
-                                   // Apply immediately (don’t wait for SLEEP)
+        post_cmd(&cmd);
+        take_downlink_snapshot();
+
         Serial.printf("[DL6] APPLY NOW flags=0x%02X uA=%u uB=%u\n",
                       (unsigned)g_pending_cmd.flags,
                       (unsigned)g_pending_cmd.unitsA,
                       (unsigned)g_pending_cmd.unitsB);
-        apply_downlink_snapshot();  // must clear g_need_vlv_update inside (or clear it here)
-        //g_need_vlv_update = true;
-        //xSemaphoreGive(g_uiSem);
-        request_work_after_settle_30s();     // only after a real valve command
-        g_awake_until_ms = millis() + 8000;  // stay awake 8s for debug/response
+
+        apply_downlink_snapshot();
+        request_work_after_settle_30s();
+        g_awake_until_ms = millis() + 8000;
+
         break;
       }
 
@@ -918,9 +758,11 @@ void downLinkDataHandle(McpsIndication_t *mcpsIndication) {
           Serial.println("name ignored (len)");
           break;
         }
+
         char new_name[MAX_NAME + 1];
         size_t wrote = 0;
         bool okAscii = true;
+
         for (size_t i = 0; i < len; ++i) {
           char c = (char)buf[i];
           if ((unsigned char)c < 0x20 || (unsigned char)c > 0x7E) {
@@ -930,18 +772,20 @@ void downLinkDataHandle(McpsIndication_t *mcpsIndication) {
           new_name[i] = c;
           wrote = i + 1;
         }
+
         if (!okAscii) {
           Serial.println("name ignored (non-ASCII)");
           break;
         }
+
         new_name[wrote] = '\0';
         strncpy(g_name, new_name, sizeof(g_name) - 1);
         g_name[sizeof(g_name) - 1] = '\0';
-        if (prefs.begin(NS, false)) {
-          (void)prefs.putString(K_NAME, new_name);
-          prefs.end();
-        }
-        Serial.println("#####name is updated");
+
+        bool ok = save_device_name_cfg(prefs, cfg::NS, new_name, cfg::K_NAME);
+
+        Serial.printf("#####name %s\n", ok ? "stored" : "NVS_FAIL");
+
         if (g_work_task) {
           xTaskNotify(g_work_task, EVT_UI_REQUEST, eSetBits);
         }
@@ -949,74 +793,96 @@ void downLinkDataHandle(McpsIndication_t *mcpsIndication) {
         break;
       }
 
-    case 8:
-      {  // ULP wake threshold
-        uint16_t th = (len == 1) ? (uint16_t)buf[0]
-                                 : (len >= 2 ? (uint16_t)buf[0] << 8 | (uint16_t)buf[1] : 0);
+    case 8:  // ULP wake threshold
+      {
+        uint16_t th = (len == 1)
+                        ? (uint16_t)buf[0]
+                        : (len >= 2 ? ((uint16_t)buf[0] << 8) | (uint16_t)buf[1] : 0);
+
         RTC_SLOW_MEMORY[ULP_WAKE_THRESHOLD] = th;
-        if (prefs.begin(NS, false)) {
-          (void)prefs.putUShort(K_WAKE_TH, th);
+
+        bool ok = false;
+        if (prefs.begin(cfg::NS, false)) {
+          ok = pref_put_ushort(prefs, cfg::K_WAKE_TH, th);
           prefs.end();
         }
-        Serial.printf("#####NVS reed threshold write (value=%u)\n", (unsigned)th);
+
+        Serial.printf("#####NVS reed threshold write (value=%u) %s\n",
+                      (unsigned)th,
+                      ok ? "stored" : "NVS_FAIL");
+
         if (g_work_task) {
           xTaskNotify(g_work_task, EVT_UI_REQUEST, eSetBits);
         }
         g_awake_until_ms = millis() + 8000;
+
         break;
       }
 
-    case 22:
-      {  // calib: inv_m_u32 (u32 BE), b_x10 (s32 BE)
+    case 22:  // calib: inv_m_u32 (u32 BE), b_x10 (s32 BE)
+      {
         if (len != 8) {
           Serial.println("calib ignored (len!=8)");
           break;
         }
-        uint32_t invm = ((uint32_t)buf[0] << 24) | ((uint32_t)buf[1] << 16)
-                        | ((uint32_t)buf[2] << 8) | (uint32_t)buf[3];
-        int32_t bx10 = (int32_t)(((uint32_t)buf[4] << 24) | ((uint32_t)buf[5] << 16)
-                                 | ((uint32_t)buf[6] << 8) | (uint32_t)buf[7]);
+
+        uint32_t invm = ((uint32_t)buf[0] << 24) | ((uint32_t)buf[1] << 16) | ((uint32_t)buf[2] << 8) | (uint32_t)buf[3];
+
+        int32_t bx10 = (int32_t)(((uint32_t)buf[4] << 24) | ((uint32_t)buf[5] << 16) | ((uint32_t)buf[6] << 8) | (uint32_t)buf[7]);
+
         if (invm == 0 || invm > 5000000u) {
           Serial.println("calib ignored (inv_m out of range)");
           break;
         }
+
         inv_m_u32 = invm;
         b_x10 = bx10;
-        bool ok = false;
-        if (prefs.begin(NS, false)) {
-          ok = (prefs.putUInt(K_INV_M, inv_m_u32) == sizeof(uint32_t));
-          ok &= (prefs.putInt(K_BX10, b_x10) == sizeof(int32_t));
-          prefs.end();
-        }
-        Serial.printf("#####calib %s: inv_m=%u cnt/m  b=%.1f m\n", ok ? "stored" : "FAILED",
-                      inv_m_u32, b_x10 / 10.0f);
+
+        bool ok = save_calibration_cfg(prefs,
+                                       cfg::NS,
+                                       inv_m_u32,
+                                       b_x10,
+                                       cfg::K_INV_M,
+                                       cfg::K_BX10);
+
+        Serial.printf("#####calib %s: inv_m=%u cnt/m  b=%.1f m\n",
+                      ok ? "stored" : "FAILED",
+                      inv_m_u32,
+                      b_x10 / 10.0f);
         break;
       }
 
-    case 23:
-      {  // lake depth setpoint (sensor depth). **BIG-ENDIAN** [MSB, LSB]
+    case 23:  // lake depth setpoint (sensor depth). BIG-ENDIAN [MSB, LSB]
+      {
         if (len != 2) {
           Serial.println("lake-depth ignored (len!=2)");
           break;
         }
-        uint16_t depth_mm = ((uint16_t)buf[0] << 8) | (uint16_t)buf[1];  // BE: MSB first
-        g_lake_depth_mm = depth_mm;
+
+        uint16_t depth_mm = ((uint16_t)buf[0] << 8) | (uint16_t)buf[1];
+        g_lake_sensor_mm = depth_mm;
+
         bool ok = false;
-        if (prefs.begin(NS, false)) {
-          ok = (prefs.putUShort(K_LAKE_MM, depth_mm) == sizeof(uint16_t));
+        if (prefs.begin(cfg::NS, false)) {
+          ok = pref_put_ushort(prefs, cfg::K_LAKE_MM, g_lake_sensor_mm);
           prefs.end();
         }
+
         Serial.printf("#####lake-depth set: %u (%.3f m) %s\n",
-                      depth_mm, depth_mm / 1000.0f, ok ? "stored" : "NVS_FAIL");
+                      g_lake_sensor_mm,
+                      g_lake_sensor_mm / 1000.0f,
+                      ok ? "stored" : "NVS_FAIL");
+
         if (g_work_task) {
           xTaskNotify(g_work_task, EVT_UI_REQUEST, eSetBits);
         }
         g_awake_until_ms = millis() + 8000;
+
         break;
       }
 
-    case 24:
-      {  // valve config: v0_ms(2) v1_ms(2) flags(1) [reserved(1)]  **BIG-ENDIAN**
+    case 24:  // valve config: v0_ms(2) v1_ms(2) flags(1) [reserved(1)] BIG-ENDIAN
+      {
         if (len != 5 && len != 6) {
           Serial.println("valve-cfg ignored (len!=5/6)");
           break;
@@ -1029,28 +895,28 @@ void downLinkDataHandle(McpsIndication_t *mcpsIndication) {
         bool v0_fwd = (flags & 0x01) != 0;
         bool v1_fwd = (flags & 0x02) != 0;
 
-        // Clamp (safety)
+        // Clamp
         v0_ms = (v0_ms < 50) ? 50 : (v0_ms > 1000) ? 1000
                                                    : v0_ms;
         v1_ms = (v1_ms < 50) ? 50 : (v1_ms > 1000) ? 1000
                                                    : v1_ms;
 
-        // Apply immediately (RTC vars)
+        // Apply immediately
         g_v0_act_ms = v0_ms;
         g_v1_act_ms = v1_ms;
         g_v0_open_fwd = v0_fwd;
         g_v1_open_fwd = v1_fwd;
 
-        // Persist
-        bool ok = false;
-        if (prefs.begin(NS, false)) {
-          bool ok1 = (prefs.putUShort("v0_act_ms", g_v0_act_ms) == sizeof(uint16_t));
-          bool ok2 = (prefs.putUShort("v1_act_ms", g_v1_act_ms) == sizeof(uint16_t));
-          bool ok3 = prefs.putBool("v0_open_fwd", g_v0_open_fwd);
-          bool ok4 = prefs.putBool("v1_open_fwd", g_v1_open_fwd);
-          prefs.end();
-          ok = ok1 && ok2 && ok3 && ok4;
-        }
+        bool ok = save_valve_cfg(prefs,
+                                 cfg::NS,
+                                 g_v0_act_ms,
+                                 g_v1_act_ms,
+                                 g_v0_open_fwd,
+                                 g_v1_open_fwd,
+                                 cfg::K_V0_ACT,
+                                 cfg::K_V1_ACT,
+                                 cfg::K_V0_FWD,
+                                 cfg::K_V1_FWD);
 
         Serial.printf("#####valve-cfg set: v0=%u ms (%s)  v1=%u ms (%s) flags=0x%02X %s\n",
                       (unsigned)g_v0_act_ms, g_v0_open_fwd ? "FWD" : "REV",
@@ -1060,9 +926,7 @@ void downLinkDataHandle(McpsIndication_t *mcpsIndication) {
 
         break;
       }
-
-  }  // of switch
-
+  }
 
   revrssi = mcpsIndication->Rssi;
   revsnr = mcpsIndication->Snr;
@@ -1233,54 +1097,55 @@ static void rs485_spin() {
 }
 static bool load_cfg_into_rtc_on_coldboot() {
 
-  if (!prefs.begin(NS, /*readOnly=*/true)) {  // NS == "cfg"
+  if (!prefs.begin(cfg::NS, /*readOnly=*/true)) {
     Serial.println("[CFG] prefs.begin failed");
     return false;
   }
 
-  // ---- schema / identity ----
-  g_schema_ver = prefs.getUChar(K_SCHEMA, 0);
-  g_device_role = prefs.getUChar(K_ROLE, 0);
-  g_uplink_fport = prefs.getUChar(K_FPORT, 0);
-  g_lake_type = prefs.getUChar(K_LAKE_TYP, 0);
+  pref_get_uchar(prefs, cfg::K_SCHEMA, 0, g_schema_ver);
+  pref_get_uchar(prefs, cfg::K_ROLE, 0, g_device_role);
+  pref_get_uchar(prefs, cfg::K_FPORT, 0, g_uplink_fport);
+  pref_get_uchar(prefs, cfg::K_LAKE_TYP, 0, g_lake_type);
 
   if (g_schema_ver == 0) {
     g_schema_ver = CFG_SCHEMA_VERSION;
     Serial.printf("[CFG] schema_ver missing (using default %u, not stored)\n",
                   (unsigned)g_schema_ver);
   }
-  // ---- existing config you already use ----
-  g_lake_depth_mm = prefs.getUShort(K_LAKE_MM, g_lake_depth_mm);
 
-  uint16_t th = prefs.getUShort(K_WAKE_TH, PULSE_THRESHOLD);
+  pref_get_ushort(prefs, cfg::K_LAKE_MM, g_lake_sensor_mm, g_lake_sensor_mm);
+  // sanity clamp (protect against corrupted NVS)
+  if (g_lake_sensor_mm > 50000) g_lake_sensor_mm = 50000;
+
+  uint16_t th = PULSE_THRESHOLD;
+  pref_get_ushort(prefs, cfg::K_WAKE_TH, PULSE_THRESHOLD, th);
   RTC_SLOW_MEMORY[ULP_WAKE_THRESHOLD] = th;
 
   char tmp[13] = {};
-  if (prefs.isKey(K_NAME)) {
-    prefs.getString(K_NAME, tmp, sizeof(tmp));
-    if (tmp[0]) {
-      strncpy(g_name, tmp, sizeof(g_name) - 1);
-      g_name[sizeof(g_name) - 1] = '\0';
-    }
+  if (pref_get_string(prefs, cfg::K_NAME, tmp, sizeof(tmp))) {
+    strncpy(g_name, tmp, sizeof(g_name) - 1);
+    g_name[sizeof(g_name) - 1] = '\0';
   }
 
-  inv_m_u32 = prefs.getUInt(K_INV_M, inv_m_u32);
-  b_x10 = prefs.getInt(K_BX10, b_x10);
+  load_calibration_cfg(prefs,
+                       inv_m_u32,
+                       b_x10,
+                       cfg::K_INV_M,
+                       cfg::K_BX10);
 
-  // ---- valve behavior (now kept in cfg) ----
-  //if (!prefs.isKey(K_V0_ACT)) prefs.putUShort(K_V0_ACT, g_v0_act_ms);
-  //if (!prefs.isKey(K_V1_ACT)) prefs.putUShort(K_V1_ACT, g_v1_act_ms);
-  g_v0_act_ms = prefs.getUShort(K_V0_ACT, g_v0_act_ms);
-  g_v1_act_ms = prefs.getUShort(K_V1_ACT, g_v1_act_ms);
-
-  //if (!prefs.isKey(K_V0_FWD)) prefs.putBool(K_V0_FWD, g_v0_open_fwd);
-  //if (!prefs.isKey(K_V1_FWD)) prefs.putBool(K_V1_FWD, g_v1_open_fwd);
-  g_v0_open_fwd = prefs.getBool(K_V0_FWD, g_v0_open_fwd);
-  g_v1_open_fwd = prefs.getBool(K_V1_FWD, g_v1_open_fwd);
+  load_valve_cfg(prefs,
+                 g_v0_act_ms,
+                 g_v1_act_ms,
+                 g_v0_open_fwd,
+                 g_v1_open_fwd,
+                 cfg::K_V0_ACT,
+                 cfg::K_V1_ACT,
+                 cfg::K_V0_FWD,
+                 cfg::K_V1_FWD);
 
   prefs.end();
 
-  // ---- sanity / clamps (keep your existing clamp style) ----
+  // ---- sanity / clamps ----
   g_v0_act_ms = (g_v0_act_ms < 50) ? 50 : (g_v0_act_ms > 1000) ? 1000
                                                                : g_v0_act_ms;
   g_v1_act_ms = (g_v1_act_ms < 50) ? 50 : (g_v1_act_ms > 1000) ? 1000
@@ -1298,13 +1163,13 @@ static bool load_cfg_into_rtc_on_coldboot() {
   appPort = g_uplink_fport;
 
   // ---- LoRaWAN OTAA identity lives in NVS namespace "lorawan" ----
-  if (!prefs.begin(NS_LORAWAN, /*readOnly=*/true)) {
+  if (!prefs.begin(cfg::NS_LORAWAN, /*readOnly=*/true)) {
     Serial.println("[LORAWAN] prefs.begin failed");
     return false;
   }
 
   // Optional: honor your provisioning marker
-  if (!prefs.getBool(K_PROV, false)) {
+  if (!prefs.getBool(cfg::K_PROV, false)) {
     Serial.println("[LORAWAN] not provisioned");
     prefs.end();
     return false;
@@ -1312,14 +1177,14 @@ static bool load_cfg_into_rtc_on_coldboot() {
 
   size_t n = 0;
 
-  n = prefs.getBytes(K_DEVEUI, devEui, 8);
+  n = prefs.getBytes(cfg::K_DEVEUI, devEui, 8);
   if (n != 8) {
     Serial.printf("[LORAWAN] missing/short devEui (got %u bytes)\n", (unsigned)n);
     prefs.end();
     return false;
   }
 
-  n = prefs.getBytes(K_APPKEY, appKey, 16);
+  n = prefs.getBytes(cfg::K_APPKEY, appKey, 16);
   if (n != 16) {
     Serial.printf("[LORAWAN] missing/short appKey (got %u bytes)\n", (unsigned)n);
     prefs.end();
@@ -1340,8 +1205,8 @@ static bool load_cfg_into_rtc_on_coldboot() {
                 (unsigned)g_lake_type,
                 g_name);
 
-  Serial.printf("[CFG] lake_depth_mm=%u  wake_th=%u  inv_m=%u  b_x10=%d\n",
-                (unsigned)g_lake_depth_mm,
+  Serial.printf("[CFG] lake_sensor_mm=%u  wake_th=%u  inv_m=%u  b_x10=%d\n",
+                (unsigned)g_lake_sensor_mm,
                 (unsigned)RTC_SLOW_MEMORY[ULP_WAKE_THRESHOLD],
                 (unsigned)inv_m_u32,
                 (int)b_x10);
@@ -1352,7 +1217,6 @@ static bool load_cfg_into_rtc_on_coldboot() {
 
   return true;
 }
-
 void setup() {
 
   Serial.begin(115200);
@@ -1369,7 +1233,7 @@ void setup() {
   if (!g_work_task) {
     xTaskCreatePinnedToCore(work_task, "work", 4096, nullptr, 1, &g_work_task, 1);
   }
-  
+
   Serial.println("Booting...");
 
   if (g_uiSem == NULL) {
@@ -1504,6 +1368,9 @@ void setup() {
       }
       break;
   }  // end switch(cause)
+
+  //  for testing only.........................................................
+  g_lake_type = 3;
 
 
   static uint16_t loop_count = 0;
