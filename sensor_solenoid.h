@@ -167,6 +167,7 @@ enum {
   ULP_PROG_START = 24,   // load instructions here
 };
 
+//  label enums
 enum {
   ULP_ENTRY_LABEL   = 0,
   ULP_SKIP_HI_INC   = 1,

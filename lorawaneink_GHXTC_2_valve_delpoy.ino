@@ -59,6 +59,20 @@ extern int revsnr;
 // apply_downlink_snapshot(&g_cmd, &valveState);
 // tick_timers(&valveState);              // your existing decrement/auto-off
 
+static void debug_rtc_read_compare()
+{
+    uint32_t reg = REG_READ(RTC_GPIO_IN_REG);
+    uint32_t bit = (reg >> (RTC_GPIO_INDEX + RTC_GPIO_IN_NEXT_S)) & 1U;
+    int gpio = digitalRead(PIN_REED_P);
+
+    Serial.printf(
+        "GPIO=%d  RTCbit=%lu  RTC_GPIO_IN_REG=0x%08lX  shift=%u\n",
+        gpio,
+        (unsigned long)bit,
+        (unsigned long)reg,
+        (unsigned)(RTC_GPIO_INDEX + RTC_GPIO_IN_NEXT_S)
+    );
+}
 void request_work_after_settle_30s(void) {
   g_work_pending = true;
 
@@ -141,7 +155,7 @@ static void work_task(void *) {
             //pinMode(Eink_CS, OUTPUT);
             //digitalWrite(Eink_CS, HIGH);
             Serial.println("about to SEND");
-            prepareTxFrame(appPort);  // builds payload (may call pop_data inside your version)
+            prepareTxFrame(g_uplink_fport);  // builds payload (may call pop_data inside your version)
             g_last_tx_ms = millis();
             Serial.printf("[TX] sent @%lu ms -> RX guard start\n", (unsigned long)g_last_tx_ms);
             LoRaWAN.send();
@@ -566,10 +580,10 @@ void pop_data(void) {
 
     //wPres[0] = (pressResult >> 8);      //  for the data frame transmission
     //wPres[1] = (pressResult & 0xFF);
-    g_lake_level_mm = (int16_t)g_lake_depth_mm - (int16_t)g_lake_sensor_mm ;
-       Serial.printf("g_lake_depth_mm %u \n", g_lake_depth_mm);
-          Serial.printf("g_lake_level_mm %d \n", g_lake_level_mm);
-             Serial.printf("g_lake_sensor_mm %u \n", g_lake_sensor_mm);
+    g_lake_level_mm = (int16_t)g_lake_depth_mm - (int16_t)g_lake_sensor_mm;
+    Serial.printf("g_lake_depth_mm %u \n", g_lake_depth_mm);
+    Serial.printf("g_lake_level_mm %d \n", g_lake_level_mm);
+    Serial.printf("g_lake_sensor_mm %u \n", g_lake_sensor_mm);
   }
 }
 
@@ -1159,7 +1173,6 @@ static bool load_cfg_into_rtc_on_coldboot() {
     return false;
   }
 
-  // fPort becomes your application port
   appPort = g_uplink_fport;
 
   // ---- LoRaWAN OTAA identity lives in NVS namespace "lorawan" ----
@@ -1244,6 +1257,12 @@ void setup() {
   hardware_pins_init();  //
   setPowerEnable(1);
   delay(50);  // rail settle
+//  DEBUG ONLY ++++++++++++++++++++++++++
+
+while (1) {
+    debug_rtc_read_compare();
+    delay(500);
+}
 
   // retry-probe window (~300 ms)
   uint32_t deadline = millis() + 300;
@@ -1292,6 +1311,7 @@ void setup() {
       {
         uint32_t count = read_count32();
         (void)count;
+        appPort = g_uplink_fport;
         xSemaphoreGive(g_uiSem);
       }
       break;
@@ -1303,6 +1323,7 @@ void setup() {
           initialCycleFast--;
         }
         Serial.printf("Woke by RTC TIMER, pulse count = %u\n", count);
+        appPort = g_uplink_fport;
         xSemaphoreGive(g_uiSem);
       }
       break;
@@ -1312,7 +1333,7 @@ void setup() {
         Serial.printf("WAKEUP_BY_RESTART:::\n");
         memset(RTC_SLOW_MEM, 0, CONFIG_ULP_COPROC_RESERVE_MEM);
 
-        // Load cfg once into RTC, and set appPort from cfg/uplink_fport
+        // Load cfg once into RTC
         if (!load_cfg_into_rtc_on_coldboot()) {
           Serial.println("[CFG] load failed - halting");
           while (true) delay(1000);
@@ -1336,7 +1357,7 @@ void setup() {
         size_t sz = sizeof(ulp_program) / sizeof(ulp_insn_t);
         esp_err_t r = ulp_process_macros_and_load(ULP_PROG_START, ulp_program, &sz);
         Serial.printf("load - %s, %u instructions\n", esp_err_to_name(r), (unsigned)sz);
-        ESP_ERROR_CHECK(ulp_run(ULP_PROG_START));
+        //ESP_ERROR_CHECK(ulp_run(ULP_PROG_START));
         if (g_device_role == ROLE_VALVE) {
           if (g_coldboot_valve_init_done == 0) {
             for (int t = 0; t < 1; t++) {
@@ -1357,6 +1378,11 @@ void setup() {
             Serial.println("valve init skipped (already done this power-up)");
           }
         }
+        if (g_device_role == ROLE_METER) {
+          Serial.printf("Waking up ULP with role %u \n", g_device_role);
+          ESP_ERROR_CHECK(esp_sleep_enable_ulp_wakeup());
+          ESP_ERROR_CHECK(ulp_run(ULP_PROG_START));
+        }
       }
       break;
 
@@ -1364,14 +1390,11 @@ void setup() {
       {
         uint32_t count = read_count32();
         Serial.printf("Woke by DEFAULT, pulse count = %u\n", count);
+        appPort = g_uplink_fport;
         xSemaphoreGive(g_uiSem);
       }
       break;
   }  // end switch(cause)
-
-  //  for testing only.........................................................
-  g_lake_type = 3;
-
 
   static uint16_t loop_count = 0;
   static uint16_t raw_pressure = 0;
@@ -1409,6 +1432,7 @@ void setup() {
 //############################################################################
 #endif
 
+  //  now tick valve timers
   if (g_device_role == ROLE_VALVE) {
     tick_timers(valveState);
     uint32_t t_end = millis() + 200;
@@ -1416,6 +1440,8 @@ void setup() {
       vTaskDelay(pdMS_TO_TICKS(10));
     }
   }
+
+  //wake the mcu
   Mcu.begin(HELTEC_BOARD, SLOW_CLK_TPYE);
   vTaskDelay(pdMS_TO_TICKS(100));
   static bool displayInited = false;
@@ -1425,9 +1451,15 @@ void setup() {
     display.screenRotate(ANGLE_180_DEGREE);
     display.setFont(ArialMT_Plain_24);
   }
-  //vTaskDelay(pdMS_TO_TICKS(50));  // short settle; NOT seconds
-  //display_status();
 
+  //  DEBUG ONLY
+  while (1) {
+    for (int i = 0; i < 25; i++) {
+      Serial.printf(" [%2d]: 0x%08X\n", i, RTC_SLOW_MEM[i]);
+    }
+    delay(20000);
+  }
+  //vTaskDelay(pdMS_TO_TICKS(50));  // short settle; NOT seconds
   //Serial.println("BOOT: after HELTEC_B start, Serial ready");
   if (!adc.begin(ADC_ADDR, &Wire)) {
     Serial.println("MCP3421 not found on Wire");

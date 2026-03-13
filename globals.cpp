@@ -100,4 +100,4 @@ RTC_DATA_ATTR uint8_t g_device_role = 0;
 RTC_DATA_ATTR uint8_t g_uplink_fport = 0;
 RTC_DATA_ATTR uint8_t g_lake_type = 0;
 RTC_DATA_ATTR uint8_t g_schema_ver = 0;
-RTC_DATA_ATTR uint8_t appPort = 0;
+RTC_DATA_ATTR uint8_t appPort;
