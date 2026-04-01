@@ -6,7 +6,7 @@
 //#define CALIBRATION_MODE true  //  FOR CALIBRATING THE SENSORS, NO LORAWAN, SERIAL OUTPUT, trips valves on and off
 
 //define REED_NODE       true      //  count reed closures of one switch for water flow meter
-#define VALVE_NODE true  //  two valve controlller and possible line pressure
+//#define VALVE_NODE true  //  two valve controlller and possible line pressure
 //#define SOIL_SENSOR_NODE true     //  two soil temp moist and possible pH
 //#define LAKE_NODE  true           //  one 16 bit number reflecting lake depth, calibration constants in device table
 
@@ -59,19 +59,17 @@ extern int revsnr;
 // apply_downlink_snapshot(&g_cmd, &valveState);
 // tick_timers(&valveState);              // your existing decrement/auto-off
 
-static void debug_rtc_read_compare()
-{
-    uint32_t reg = REG_READ(RTC_GPIO_IN_REG);
-    uint32_t bit = (reg >> (RTC_GPIO_INDEX + RTC_GPIO_IN_NEXT_S)) & 1U;
-    int gpio = digitalRead(PIN_REED_P);
+static void debug_rtc_read_compare() {
+  uint32_t reg = REG_READ(RTC_GPIO_IN_REG);
+  uint32_t bit = (reg >> (RTC_GPIO_INDEX + RTC_GPIO_IN_NEXT_S)) & 1U;
+  int gpio = digitalRead(PIN_REED_P);
 
-    Serial.printf(
-        "GPIO=%d  RTCbit=%lu  RTC_GPIO_IN_REG=0x%08lX  shift=%u\n",
-        gpio,
-        (unsigned long)bit,
-        (unsigned long)reg,
-        (unsigned)(RTC_GPIO_INDEX + RTC_GPIO_IN_NEXT_S)
-    );
+  Serial.printf(
+    "GPIO=%d  RTCbit=%lu  RTC_GPIO_IN_REG=0x%08lX  shift=%u\n",
+    gpio,
+    (unsigned long)bit,
+    (unsigned long)reg,
+    (unsigned)(RTC_GPIO_INDEX + RTC_GPIO_IN_NEXT_S));
 }
 void request_work_after_settle_30s(void) {
   g_work_pending = true;
@@ -680,6 +678,7 @@ void downLinkDataHandle(McpsIndication_t *mcpsIndication) {
   last_dl = mcpsIndication->DownLinkCounter;
 
   const uint8_t *buf = mcpsIndication->Buffer;
+
   const uint8_t len = mcpsIndication->BufferSize;
   const uint8_t port = mcpsIndication->Port;
   const char *rxw = (mcpsIndication->RxSlot) ? "RXWIN2" : "RXWIN1";
@@ -950,97 +949,66 @@ void downLinkDataHandle(McpsIndication_t *mcpsIndication) {
 
 /* set up the ULP to count pulses, and wake on 100 pulses, after each lorawan data send, the last_pulse_count is advanced*/
 
+// Shared working scratch file for ULP debugging on ESP32-S3
+// Purpose: keep one synchronized copy of the exact code under discussion.
+// Current status:
+// - Mcu.begin(...) moved earlier in setup to preserve RTC ownership of GPIO17.
+// - RTC path now sees reed changes in awake code.
+// - ULP timer increments.
+// - ULP counting still does not increment.
+// - Unnecessary debug stores removed; temporary bypass tests remain in place.
 static const ulp_insn_t ulp_program[] = {
   M_LABEL(ULP_ENTRY_LABEL),
-  I_DELAY(0x8fff),  // needs to be calibrated to time
+  I_DELAY(45),  // ≈500 µs @90 kHz
 
-  // At top of ulp_program, BEFORE merging PENDING into COUNT:
-  I_RD_REG(RTC_CNTL_LOW_POWER_ST_REG, RTC_CNTL_MAIN_STATE_IN_IDLE_S, RTC_CNTL_MAIN_STATE_IN_IDLE_S),
-  M_BG(ULP_SKIP_MERGE, 0),  // if CPU is awake (>0), skip the merge this cycle
+// ── Merge ULP_COUNT_PENDING into ULP_COUNT if pending > 0 ───────────────
+I_MOVI(R1, ULP_COUNT_PENDING),
+I_LD(R0, R1, 0),
+M_BL(ULP_SKIP_MERGE, 0),
 
-  // ── Merge PENDING (16-bit) into 32-bit COUNT (HI:LO) ──
-  I_MOVI(R1, ULP_COUNT_PENDING),
-  I_LD(R0, R1, 0),
-  I_SUBI(R0, R0, 0),
-  M_BXZ(ULP_SKIP_MERGE),
+I_MOVI(R2, ULP_COUNT),
+I_LD(R3, R2, 0),
+I_ADDR(R3, R3, R0),
+I_ST(R3, R2, 0),
 
-  I_MOVI(R2, ULP_COUNT_LO),
-  I_LD(R3, R2, 0),
-  I_ADDR(R3, R3, R0),  // add pending → LO
-  I_ST(R3, R2, 0),
-  M_BXF(ULP_BUMP_HI_MERGE),  // overflow → bump HI
-  M_BX(ULP_CLR_PENDING),
+I_MOVI(R0, 0),
+I_ST(R0, R1, 0),  // clear pending
 
-  M_LABEL(ULP_BUMP_HI_MERGE),
-  I_MOVI(R2, ULP_COUNT_HI),
-  I_LD(R3, R2, 0),
-  I_ADDI(R3, R3, 1),
-  I_ST(R3, R2, 0),
-
-  M_LABEL(ULP_CLR_PENDING),
-  I_MOVI(R0, 0),
-  I_MOVI(R1, ULP_COUNT_PENDING),
-  I_ST(R0, R1, 0),
-
-  M_LABEL(ULP_SKIP_MERGE),
+M_LABEL(ULP_SKIP_MERGE),
 
   //── 0) ULP_TIMER (low/hi) ────────────────────────────────
-  I_MOVI(R1, ULP_TIMER_LO),
-  I_LD(R3, R1, 0),
-  I_ADDI(R3, R3, 1),
-  I_ST(R3, R1, 0),
+  I_MOVI(R1, ULP_TIMER_LO), I_LD(R3, R1, 0), I_ADDI(R3, R3, 1), I_ST(R3, R1, 0),
   I_MOVR(R0, R3),
   M_BG(ULP_NO_TIMER_WRAP, 0),  // skip if low > 0
 
-  // wrap → bump hi or tick-pop
-  I_MOVI(R1, ULP_TIMER_HI),
-  I_LD(R2, R1, 0),
-  I_MOVI(R0, 0xFFFF),
-  I_SUBR(R0, R0, R2),         // 0xFFFF - hi
-  M_BL(ULP_SET_TICK_POP, 1),  // if hi == max → pop
-  I_ADDI(R2, R2, 1),
-  I_ST(R2, R1, 0),
-  M_BX(ULP_NO_TIMER_WRAP),
+    // wrap → bump hi or tick-pop
+    I_MOVI(R1, ULP_TIMER_HI), I_LD(R2, R1, 0),
+    I_MOVI(R0, 0xFFFF), I_SUBR(R0, R0, R2),      // 0xFFFF - hi
+    M_BL(ULP_SET_TICK_POP, 1),                    // if hi == max → pop
+    I_ADDI(R2, R2, 1), I_ST(R2, R1, 0), M_BX(ULP_NO_TIMER_WRAP),
 
   M_LABEL(ULP_SET_TICK_POP),
-  I_MOVI(R0, 1),
-  I_MOVI(R1, ULP_TICK_POP),
-  I_ST(R0, R1, 0),
-  I_MOVI(R2, 0),
-  I_MOVI(R1, ULP_TIMER_HI),
-  I_ST(R2, R1, 0),
-  M_BX(ULP_NO_TIMER_WRAP),
+    I_MOVI(R0, 1), I_MOVI(R1, ULP_TICK_POP), I_ST(R0, R1, 0),
+    I_MOVI(R2, 0), I_MOVI(R1, ULP_TIMER_HI), I_ST(R2, R1, 0),
+    M_BX(ULP_NO_TIMER_WRAP),
 
   M_LABEL(ULP_NO_TIMER_WRAP),
 
   //── 1) Sample GPIO → raw_bit ─────────────────────────────
   I_RD_REG(RTC_GPIO_IN_REG, RTC_GPIO_INDEX + RTC_GPIO_IN_NEXT_S, RTC_GPIO_INDEX + RTC_GPIO_IN_NEXT_S),
-  I_ANDI(R0, R0, 1),
-  I_MOVR(R2, R0),
+  I_ANDI(R0, R0, 1), I_MOVR(R2, R0),
 
   //── 2) Rising-edge detect (raw_bit - prev_state == 1) ─────
-  I_MOVI(R1, ULP_PREV_STATE),
-  I_LD(R0, R1, 0),
-  I_SUBR(R0, R2, R0),
+  I_MOVI(R1, ULP_PREV_STATE), I_LD(R0, R1, 0), I_SUBR(R0, R2, R0),
   I_ST(R2, R1, 0),
-  M_BL(ULP_NO_EDGE, 1),
-  M_BG(ULP_NO_EDGE, 1),
+  M_BL(ULP_NO_EDGE, 1), M_BG(ULP_NO_EDGE, 1),
 
   //── 3) Conditional bump ─────────────────────────────────────
   I_RD_REG(RTC_CNTL_LOW_POWER_ST_REG, RTC_CNTL_MAIN_STATE_IN_IDLE_S, RTC_CNTL_MAIN_STATE_IN_IDLE_S),
-  M_BG(ULP_CPU_IS_AWAKE, 0),  // if flag == 1, CPU is awake, use pending count
+  M_BG(ULP_CPU_IS_AWAKE, 0),  // if CPU is not idle, use pending count
 
-  // ── CPU idle → bump 32-bit COUNT (HI:LO) ──
-
-  I_MOVI(R1, ULP_COUNT_LO),
-  I_LD(R3, R1, 0),
-  I_ADDI(R3, R3, 1),
-  I_ST(R3, R1, 0),
-  M_BXF(ULP_BUMP_HI_EDGE),
-  M_BX(ULP_AFTER_COUNT),
-
-  M_LABEL(ULP_BUMP_HI_EDGE),
-  I_MOVI(R1, ULP_COUNT_HI),
+  // CPU is idle → bump ULP_COUNT
+  I_MOVI(R1, ULP_COUNT),
   I_LD(R3, R1, 0),
   I_ADDI(R3, R3, 1),
   I_ST(R3, R1, 0),
@@ -1052,56 +1020,39 @@ static const ulp_insn_t ulp_program[] = {
   I_LD(R3, R1, 0),
   I_ADDI(R3, R3, 1),
   I_ST(R3, R1, 0),
-  M_BX(ULP_NO_WAKE),
+  M_BX(ULP_ENTRY_LABEL),
 
   M_LABEL(ULP_AFTER_COUNT),
 
   //── 4) Snapshot ULP_TIMER → Δ lo/hi/pop ───────────────────
-  I_MOVI(R1, ULP_TIMER_LO),
-  I_LD(R0, R1, 0),
-  I_MOVI(R1, ULP_TS_DELTA_LO),
-  I_ST(R0, R1, 0),
-  I_MOVI(R1, ULP_TIMER_HI),
-  I_LD(R0, R1, 0),
-  I_MOVI(R1, ULP_TS_DELTA_HI),
-  I_ST(R0, R1, 0),
-  I_MOVI(R1, ULP_TICK_POP),
-  I_LD(R0, R1, 0),
-  I_MOVI(R1, ULP_TS_DELTA_TICK_POP),
-  I_ST(R0, R1, 0),
+  I_MOVI(R1, ULP_TIMER_LO), I_LD(R0, R1, 0), I_MOVI(R1, ULP_TS_DELTA_LO), I_ST(R0, R1, 0),
+  I_MOVI(R1, ULP_TIMER_HI), I_LD(R0, R1, 0), I_MOVI(R1, ULP_TS_DELTA_HI), I_ST(R0, R1, 0),
+  I_MOVI(R1, ULP_TICK_POP), I_LD(R0, R1, 0), I_MOVI(R1, ULP_TS_DELTA_TICK_POP), I_ST(R0, R1, 0),
   // clear timer & pop
+  I_MOVI(R0, 0), I_MOVI(R1, ULP_TIMER_LO), I_ST(R0, R1, 0),
+  I_MOVI(R1, ULP_TIMER_HI), I_ST(R0, R1, 0), I_MOVI(R1, ULP_TICK_POP), I_ST(R0, R1, 0),
 
-  I_MOVI(R0, 0),
-  I_MOVI(R1, ULP_TIMER_LO),
-  I_ST(R0, R1, 0),
-  I_MOVI(R1, ULP_TIMER_HI),
-  I_ST(R0, R1, 0),
-  I_MOVI(R1, ULP_TICK_POP),
-  I_ST(R0, R1, 0),
+  //── 5) Wake logic: diff = count - last_sent, skip if diff < threshold ─────
+  I_MOVI(R1, ULP_COUNT),           I_LD(R0, R1, 0),         // R0 = count
+  I_MOVI(R1, ULP_LAST_SENT),       I_LD(R1, R1, 0),         // R1 = last_sent
+  I_SUBR(R0, R0, R1),                                      // R0 = diff
+  I_MOVI(R1, ULP_WAKE_THRESHOLD),  I_LD(R1, R1, 0),         // R1 = threshold
 
-  // ── Wake logic: use LO only (diff16 = LO - LAST_SENT) ──
-  I_MOVI(R1, ULP_COUNT_LO),
-  I_LD(R0, R1, 0),  // R0 = LO
-  I_MOVI(R1, ULP_LAST_SENT),
-  I_LD(R1, R1, 0),     // R1 = last_sent (16-bit)
-  I_SUBR(R0, R0, R1),  // diff16
-  I_MOVI(R2, ULP_DEBUG_PIN_STATE),
-  I_ST(R0, R2, 0),
-  I_MOVI(R1, ULP_WAKE_THRESHOLD),
-  I_LD(R1, R1, 0),
-  I_SUBR(R0, R1, R0),  // threshold - diff
-  M_BG(ULP_NO_WAKE, 0),
+  I_MOVI(R2, ULP_DEBUG_PIN_STATE), I_ST(R0, R2, 0),         // debug diff
+  M_BL(ULP_NO_WAKE, 1),                                     // ✅ if diff < threshold, skip
 
   // only wake if main CPU idle
   I_RD_REG(RTC_CNTL_LOW_POWER_ST_REG, RTC_CNTL_MAIN_STATE_IN_IDLE_S, RTC_CNTL_MAIN_STATE_IN_IDLE_S),
-  M_BG(ULP_NO_WAKE, 0),  // skip if CPU awake
-
+  M_BL(ULP_NO_WAKE, 0),            // skip if CPU awake
   I_WAKE(),
 
   M_LABEL(ULP_NO_WAKE),
+    M_BX(ULP_ENTRY_LABEL),
   M_LABEL(ULP_NO_EDGE),
-  M_BX(ULP_ENTRY_LABEL),
-};
+    M_BX(ULP_ENTRY_LABEL),
+  };
+
+
 
 static void rs485_spin() {
   for (;;) {
@@ -1234,6 +1185,9 @@ void setup() {
 
   Serial.begin(115200);
   delay(1000);
+  //wake the mcu
+  Mcu.begin(HELTEC_BOARD, SLOW_CLK_TPYE);
+  vTaskDelay(pdMS_TO_TICKS(100));
 
   // ---- create timers ----
   if (!g_settle_timer) g_settle_timer = xTimerCreate("settle30", pdMS_TO_TICKS(30000), pdFALSE, nullptr, settle_timer_cb);
@@ -1257,12 +1211,12 @@ void setup() {
   hardware_pins_init();  //
   setPowerEnable(1);
   delay(50);  // rail settle
-//  DEBUG ONLY ++++++++++++++++++++++++++
+              //  DEBUG ONLY ++++++++++++++++++++++++++
 
-while (1) {
-    debug_rtc_read_compare();
-    delay(500);
-}
+  // while (1) {
+  //     debug_rtc_read_compare();
+  //     delay(500);
+  // }
 
   // retry-probe window (~300 ms)
   uint32_t deadline = millis() + 300;
@@ -1381,7 +1335,29 @@ while (1) {
         if (g_device_role == ROLE_METER) {
           Serial.printf("Waking up ULP with role %u \n", g_device_role);
           ESP_ERROR_CHECK(esp_sleep_enable_ulp_wakeup());
+          REG_SET_BIT(SENS_SAR_PERI_CLK_GATE_CONF_REG, SENS_IOMUX_CLK_EN);
+          Serial.printf("SENS_SAR_PERI_CLK_GATE_CONF_REG = 0x%08lX\n",
+                        (unsigned long)REG_READ(SENS_SAR_PERI_CLK_GATE_CONF_REG));
+          rtc_gpio_init(GPIO_NUM_17);
+          rtc_gpio_set_direction(GPIO_NUM_17, RTC_GPIO_MODE_INPUT_ONLY);
+          rtc_gpio_pulldown_dis(GPIO_NUM_17);
+          rtc_gpio_pullup_dis(GPIO_NUM_17);
+          rtc_gpio_hold_en(GPIO_NUM_17);
           ESP_ERROR_CHECK(ulp_run(ULP_PROG_START));
+          // while (1) {
+          //   Serial.printf(
+          //     "PIN=%lu  PEND=%lu  LO=%lu  HI=%lu\n",
+          //     (unsigned long)RTC_SLOW_MEM[ULP_DEBUG_PIN_STATE],
+          //     (unsigned long)RTC_SLOW_MEM[ULP_COUNT_PENDING],
+          //     (unsigned long)RTC_SLOW_MEM[ULP_COUNT_LO],
+          //     (unsigned long)RTC_SLOW_MEM[ULP_COUNT_HI]);
+
+          //   Serial.printf("dig=%d rtc=%lu\n",
+          //                 digitalRead(PIN_REED_P),
+          //                 (unsigned long)rtc_gpio_get_level(GPIO_NUM_17));
+
+          //   delay(500);
+          // }
         }
       }
       break;
@@ -1441,9 +1417,6 @@ while (1) {
     }
   }
 
-  //wake the mcu
-  Mcu.begin(HELTEC_BOARD, SLOW_CLK_TPYE);
-  vTaskDelay(pdMS_TO_TICKS(100));
   static bool displayInited = false;
   if (!displayInited) {
     display.init();
@@ -1452,13 +1425,33 @@ while (1) {
     display.setFont(ArialMT_Plain_24);
   }
 
-  //  DEBUG ONLY
-  while (1) {
-    for (int i = 0; i < 25; i++) {
-      Serial.printf(" [%2d]: 0x%08X\n", i, RTC_SLOW_MEM[i]);
-    }
-    delay(20000);
-  }
+
+  //  debug
+
+
+  Serial.printf("RTC_GPIO_IN_REG      = 0x%08lX  periph_sel=%lu ",
+                (unsigned long)RTC_GPIO_IN_REG,
+                (unsigned long)SOC_REG_TO_ULP_PERIPH_SEL(RTC_GPIO_IN_REG));
+
+  Serial.printf("RTC_CNTL_LOW_POWER_ST_REG = 0x%08lX  periph_sel=%lu\n",
+                (unsigned long)RTC_CNTL_LOW_POWER_ST_REG,
+                (unsigned long)SOC_REG_TO_ULP_PERIPH_SEL(RTC_CNTL_LOW_POWER_ST_REG));
+
+
+    Serial.printf(
+      "PIN_DEBUG=%lu  ULP_FLOW_3=%lu  COUNT_PEND(2)=%lu  ULU_COUNT_LO=%lu  ULP_COUNT_HI=%lu  TIMER_LO=%lu  REED_DELTA=%lu ",
+      (unsigned long)RTC_SLOW_MEM[ULP_DEBUG_PIN_STATE],
+      (unsigned long)RTC_SLOW_MEM[ULP_FLOW_RATE],
+      (unsigned long)RTC_SLOW_MEM[ULP_COUNT_PENDING],
+      (unsigned long)RTC_SLOW_MEM[ULP_COUNT_LO],
+      (unsigned long)RTC_SLOW_MEM[ULP_COUNT_HI],
+      (unsigned long)RTC_SLOW_MEM[ULP_TIMER_LO],
+      (unsigned long)RTC_SLOW_MEM[ULP_REED_DELTA]);
+    Serial.printf("dig=%d rtc=%lu\n",
+                  digitalRead(PIN_REED_P),
+                  (unsigned long)rtc_gpio_get_level(GPIO_NUM_17));
+    delay(500);
+
   //vTaskDelay(pdMS_TO_TICKS(50));  // short settle; NOT seconds
   //Serial.println("BOOT: after HELTEC_B start, Serial ready");
   if (!adc.begin(ADC_ADDR, &Wire)) {

@@ -101,3 +101,30 @@ RTC_DATA_ATTR uint8_t g_uplink_fport = 0;
 RTC_DATA_ATTR uint8_t g_lake_type = 0;
 RTC_DATA_ATTR uint8_t g_schema_ver = 0;
 RTC_DATA_ATTR uint8_t appPort;
+
+const char* const ulp_var_names[] = {
+  "ULP_RSSI",
+  "ULP_SNR",
+  "ULP_BAT_PCT",
+  "ULP_LAST_SENT",
+  "ULP_COUNT_LO",
+  "ULP_COUNT_HI",
+  "ULP_PREV_STATE",
+  "ULP_VALVE_A",
+  "ULP_VALVE_B",
+  "ULP_DEBUG_PIN_STATE",
+  "ULP_TICK_POP",
+  "ULP_TS_DELTA_LO",
+  "ULP_TS_DELTA_HI",
+  "ULP_TS_DELTA_TICK_POP",
+  "ULP_TIMER_LO",
+  "ULP_TIMER_HI",
+  "ULP_REED_DELTA",
+  "ULP_FLOW_RATE",
+  "ULP_VOLUME_DELTA",
+  "ULP_WAKE_THRESHOLD",
+  "ULP_TXCYCLETIME",
+  "ULP_TXCYCLEFAST",
+  "ULP_COUNT_PENDING",
+  "ULP_COUNT"
+};

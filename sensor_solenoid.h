@@ -212,6 +212,7 @@ extern uint8_t reedcyclesTenMin[2]; // intra reed pulse converted to frequency i
 extern uint8_t soilSensorOut[6];  //  for the two soil sensors including moisture, temp and pH
 extern const char *K_INV_M;
 extern const char *K_BX10;
+extern const char* const ulp_var_names[];
 
 // Function prototypes
 void hardware_pins_init();
